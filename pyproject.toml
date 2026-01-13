@@ -28,6 +28,9 @@ dev = [
     "pytest-cov>=4.0.0",
 ]
 
+[tool.setuptools.packages.find]
+include = ["pm*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
