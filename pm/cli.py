@@ -150,7 +150,7 @@ def scan(base_path: str, verbose: bool):
 @main.command()
 @click.option("--filter", "-f", "filter_str", help="Filter: type:client, status:active")
 @click.option("--sort", "-s", default="name", help="Sort by: name, completion, activity")
-@click.option("--limit", "-n", default=50, help="Limit results")
+@click.option("--limit", "-n", default=0, help="Limit results (0 = no limit)")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 def status(filter_str: Optional[str], sort: str, limit: int, as_json: bool):
     """Show project status summary."""
@@ -180,7 +180,9 @@ def status(filter_str: Optional[str], sort: str, limit: int, as_json: bool):
     else:
         query = query.order_by(Project.name)
 
-    projects = query.limit(limit).all()
+    if limit > 0:
+        query = query.limit(limit)
+    projects = query.all()
 
     if as_json:
         data = [{
@@ -582,7 +584,7 @@ def summary():
 
 @main.command()
 @click.option("--filter", "-f", "filter_str", help="Filter: type:client, type:internal")
-@click.option("--limit", "-n", default=20, help="Limit results")
+@click.option("--limit", "-n", default=0, help="Limit results (0 = no limit)")
 @click.option("--asc", is_flag=True, help="Show lowest health first (needs attention)")
 def health(filter_str: Optional[str], limit: int, asc: bool):
     """Show projects sorted by health score."""
@@ -605,7 +607,8 @@ def health(filter_str: Optional[str], limit: int, asc: bool):
     projects_with_health.sort(key=lambda x: x[1], reverse=not asc)
 
     # Limit
-    projects_with_health = projects_with_health[:limit]
+    if limit > 0:
+        projects_with_health = projects_with_health[:limit]
 
     # Build table
     table = Table(
