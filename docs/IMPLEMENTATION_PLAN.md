@@ -82,18 +82,21 @@
 - [ ] Session history per project
 
 ### 4.3 Batch Operations
-- [ ] Launch multiple projects in parallel
+- [x] Launch multiple projects in parallel (`pm launch`)
 - [ ] Batch status updates
 - [ ] Daily/weekly reports
 
 ---
 
-## Phase 5: Integration & Automation
+## Phase 5: Integration & Automation 🔄 IN PROGRESS
 
 ### 5.1 claudecoderun Integration
+- [x] Add `pm launch` command with claudecoderun integration
+- [x] Support batch launching with --parallel option
+- [x] Filter-based launching (type:client, health:low)
+- [x] Smart context generation from project state
 - [ ] Add `--from-dashboard` mode to claudecoderun
-- [ ] Share project database
-- [ ] Stage-based launching with project manager context
+- [ ] Share project database bidirectionally
 
 ### 5.2 Background Scanning
 - [ ] Cron job or launchd for periodic scans
