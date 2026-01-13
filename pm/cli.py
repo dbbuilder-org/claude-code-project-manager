@@ -353,6 +353,176 @@ def continue_project(
 
 
 @main.command()
+@click.argument("project_names", nargs=-1)
+@click.option("--filter", "-f", "filter_str", help="Filter projects: type:client, type:internal")
+@click.option("--parallel", "-p", default=1, help="Number of projects to launch in parallel")
+@click.option("--mode", "-m", default="context", type=click.Choice(["simple", "context", "decision"]))
+@click.option("--dry-run", is_flag=True, help="Show what would be launched without executing")
+@click.option("--iterm", is_flag=True, default=True, help="Use iTerm2 (default: true)")
+@click.option("--tmux", is_flag=True, help="Use tmux instead of separate windows")
+def launch(
+    project_names: tuple,
+    filter_str: Optional[str],
+    parallel: int,
+    mode: str,
+    dry_run: bool,
+    iterm: bool,
+    tmux: bool,
+):
+    """Launch Claude Code for one or more projects.
+
+    Examples:
+        pm launch remoteC                    # Launch single project
+        pm launch remoteC anterix github-spec # Launch multiple
+        pm launch --filter type:client -p 3  # Launch clients in parallel
+        pm launch --filter type:client --tmux # Use tmux session
+    """
+    init_db()
+    session = get_session()
+    parser = ProgressParser()
+    generator = ContinuePromptGenerator()
+    prompt_mode = PromptMode(mode)
+
+    # Find projects
+    if project_names:
+        projects = []
+        for name in project_names:
+            proj = session.query(Project).filter(
+                Project.name.ilike(f"%{name}%")
+            ).first()
+            if proj:
+                projects.append(proj)
+            else:
+                console.print(f"[yellow]Warning:[/yellow] Project not found: {name}")
+    elif filter_str:
+        query = session.query(Project)
+        if filter_str.startswith("type:"):
+            category = filter_str.split(":")[1]
+            query = query.filter(Project.category == category)
+            projects = query.all()
+        elif filter_str.startswith("health:"):
+            threshold = filter_str.split(":")[1]
+            all_projects = query.all()
+            if threshold == "low":
+                projects = [p for p in all_projects if p.health_score < 40]
+            elif threshold == "attention":
+                projects = [p for p in all_projects if p.health_score < 70]
+            else:
+                projects = all_projects
+        else:
+            projects = query.all()
+    else:
+        console.print("[yellow]Specify project name(s) or --filter[/yellow]")
+        console.print("Examples:")
+        console.print("  pm launch remoteC")
+        console.print("  pm launch --filter type:client")
+        console.print("  pm launch --filter health:low")
+        session.close()
+        return
+
+    if not projects:
+        console.print("[red]No projects found[/red]")
+        session.close()
+        return
+
+    console.print(f"[bold blue]Launching {len(projects)} project(s)[/bold blue]")
+
+    # Show what will be launched
+    table = Table(box=box.SIMPLE, show_header=True, header_style="bold")
+    table.add_column("Project")
+    table.add_column("Health")
+    table.add_column("Phase")
+
+    for p in projects:
+        health = p.health_score
+        health_color = "green" if health >= 70 else ("yellow" if health >= 40 else "red")
+        table.add_row(
+            p.name,
+            f"[{health_color}]{health}[/{health_color}]",
+            p.current_phase or p.current_status or "—",
+        )
+
+    console.print(table)
+
+    if dry_run:
+        console.print("\n[dim]Dry run - no terminals launched[/dim]")
+        session.close()
+        return
+
+    # Check for claudecoderun
+    claudecoderun_path = Path.home() / "dev2" / "claudecoderun"
+    use_claudecoderun = claudecoderun_path.exists()
+
+    # Generate context files and launch
+    temp_dir = Path("/tmp/pm_launch")
+    temp_dir.mkdir(exist_ok=True)
+
+    launched = 0
+    for i, proj in enumerate(projects):
+        project_path = Path(proj.path)
+        progress = parser.parse_project(project_path)
+        prompt = generator.generate(project_path, proj.name, progress, prompt_mode)
+
+        # Create temporary coderun.md with smart context
+        if prompt.prompt_text:
+            coderun_file = temp_dir / f"{proj.name}_coderun.md"
+            coderun_file.write_text(prompt.prompt_text)
+
+        if tmux:
+            # Use tmux session
+            session_name = f"claude-{proj.name}"
+            cmd = f"tmux new-session -d -s '{session_name}' -c '{project_path}' 'claude --resume || claude'"
+            if not dry_run:
+                result = subprocess.run(cmd, shell=True, capture_output=True)
+                if result.returncode == 0:
+                    console.print(f"[green]✓[/green] Launched tmux session: {session_name}")
+                    launched += 1
+                else:
+                    console.print(f"[red]✗[/red] Failed to launch {proj.name}")
+        elif use_claudecoderun and len(projects) > 1:
+            # Use claudecoderun for batch launching
+            if i == 0:  # Only launch once with all paths
+                project_paths = [p.path for p in projects]
+                # Create a temp file listing all projects
+                batch_file = temp_dir / "batch_projects.txt"
+                batch_file.write_text("\n".join(project_paths))
+
+                run_script = claudecoderun_path / "run.sh"
+                if run_script.exists():
+                    cmd_parts = [str(run_script)]
+                    cmd_parts.extend(project_paths)
+                    if parallel > 1:
+                        cmd_parts.extend(["--parallel", "--max-parallel", str(parallel)])
+                    cmd_parts.append("--delay=2")
+
+                    console.print(f"\n[dim]Calling claudecoderun with {len(projects)} projects[/dim]")
+                    subprocess.Popen(cmd_parts, cwd=claudecoderun_path)
+                    launched = len(projects)
+                break
+        else:
+            # Use iTerm2 directly via AppleScript
+            script_path = Path(__file__).parent.parent / "scripts" / "claude-launch.sh"
+            if script_path.exists():
+                subprocess.Popen([str(script_path), proj.name])
+                console.print(f"[green]✓[/green] Launched iTerm2 for {proj.name}")
+                launched += 1
+            else:
+                # Fallback to basic Terminal
+                cmd = f'''osascript -e 'tell application "Terminal" to do script "cd {project_path} && claude --resume || claude"' '''
+                subprocess.run(cmd, shell=True)
+                console.print(f"[green]✓[/green] Launched Terminal for {proj.name}")
+                launched += 1
+
+        # Delay between launches if parallel is 1
+        if parallel == 1 and i < len(projects) - 1:
+            import time
+            time.sleep(1)
+
+    console.print(f"\n[bold green]Launched {launched} project(s)[/bold green]")
+    session.close()
+
+
+@main.command()
 @click.option("--port", "-p", default=8501, help="Dashboard port")
 def dashboard(port: int):
     """Launch the Streamlit dashboard."""
