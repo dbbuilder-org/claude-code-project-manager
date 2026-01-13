@@ -202,14 +202,15 @@ def status(filter_str: Optional[str], sort: str, limit: int, as_json: bool):
         box=box.ROUNDED,
         show_header=True,
         header_style="bold cyan",
+        expand=True,
     )
 
-    table.add_column("Project", style="bold")
-    table.add_column("Type", width=8)
-    table.add_column("Progress", width=12)
-    table.add_column("Phase/Status", width=25)
-    table.add_column("Next Action", width=30)
-    table.add_column("Flags", width=10)
+    table.add_column("Project", style="bold", width=20, no_wrap=True)
+    table.add_column("Cat", width=8)
+    table.add_column("Progress", width=15)
+    table.add_column("Phase/Status", min_width=20)
+    table.add_column("Next Action", min_width=25)
+    table.add_column("", width=8)  # Flags
 
     for p in projects:
         # Progress bar
@@ -405,6 +406,110 @@ def summary():
         title="Project Portfolio Summary",
         border_style="cyan",
     ))
+
+    session.close()
+
+
+@main.command()
+@click.option("--filter", "-f", "filter_str", help="Filter: type:client, type:internal")
+@click.option("--limit", "-n", default=20, help="Limit results")
+@click.option("--asc", is_flag=True, help="Show lowest health first (needs attention)")
+def health(filter_str: Optional[str], limit: int, asc: bool):
+    """Show projects sorted by health score."""
+    init_db()
+    session = get_session()
+
+    # Build query
+    query = session.query(Project)
+
+    # Apply filters
+    if filter_str:
+        if filter_str.startswith("type:"):
+            category = filter_str.split(":")[1]
+            query = query.filter(Project.category == category)
+
+    projects = query.all()
+
+    # Calculate health scores and sort
+    projects_with_health = [(p, p.health_score) for p in projects]
+    projects_with_health.sort(key=lambda x: x[1], reverse=not asc)
+
+    # Limit
+    projects_with_health = projects_with_health[:limit]
+
+    # Build table
+    table = Table(
+        title=f"Project Health ({'Needs Attention' if asc else 'Healthiest'} First)",
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold cyan",
+    )
+
+    table.add_column("Project", style="bold", width=22)
+    table.add_column("Cat", width=8)
+    table.add_column("Health", width=12)
+    table.add_column("Completion", width=12)
+    table.add_column("Activity", width=12)
+    table.add_column("Issues", min_width=20)
+
+    for p, score in projects_with_health:
+        # Health bar
+        filled = int(score / 10)
+        if score >= 70:
+            color = "green"
+        elif score >= 40:
+            color = "yellow"
+        else:
+            color = "red"
+        health_bar = f"[{color}]{'█' * filled}{'░' * (10 - filled)}[/{color}] {score}"
+
+        # Completion
+        comp = f"{p.completion_pct:.0f}%" if p.completion_pct else "—"
+
+        # Last activity
+        if p.last_activity:
+            days = (datetime.utcnow() - p.last_activity).days
+            if days == 0:
+                activity = "today"
+            elif days == 1:
+                activity = "yesterday"
+            elif days < 7:
+                activity = f"{days}d ago"
+            elif days < 30:
+                activity = f"{days // 7}w ago"
+            else:
+                activity = f"{days // 30}mo ago"
+        else:
+            activity = "—"
+
+        # Issues
+        issues = []
+        if p.has_pending_decision:
+            issues.append("⚠️ decision")
+        if p.git_dirty:
+            issues.append("● uncommitted")
+        if not p.has_claude_md:
+            issues.append("📄 no CLAUDE.md")
+        if p.project_type == 'generic':
+            issues.append("? generic type")
+
+        cat_colors = {"client": "green", "internal": "blue", "tool": "yellow"}
+        cat_style = cat_colors.get(p.category, "white")
+
+        table.add_row(
+            p.name,
+            f"[{cat_style}]{p.category}[/{cat_style}]",
+            health_bar,
+            comp,
+            activity,
+            ", ".join(issues) if issues else "[green]✓[/green]",
+        )
+
+    console.print(table)
+
+    # Summary
+    avg_health = sum(h for _, h in projects_with_health) / len(projects_with_health) if projects_with_health else 0
+    console.print(f"\n[dim]Average health: {avg_health:.0f}/100[/dim]")
 
     session.close()
 

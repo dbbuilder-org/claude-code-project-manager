@@ -47,6 +47,60 @@ class Project(Base):
     items = relationship("ProgressItem", back_populates="project", cascade="all, delete-orphan")
     history = relationship("ScanHistory", back_populates="project", cascade="all, delete-orphan")
 
+    @property
+    def health_score(self) -> int:
+        """Calculate project health score (0-100).
+
+        Factors:
+        - Completion progress (0-30 pts)
+        - Has CLAUDE.md (10 pts)
+        - Has progress tracking files (10 pts)
+        - Recent activity (0-20 pts)
+        - No pending decisions (10 pts)
+        - Clean git state (10 pts)
+        - Known project type (10 pts)
+        """
+        score = 0
+
+        # Completion (0-30 pts)
+        if self.completion_pct is not None:
+            score += int(self.completion_pct * 0.3)
+
+        # Has CLAUDE.md (10 pts)
+        if self.has_claude_md:
+            score += 10
+
+        # Has progress files (10 pts)
+        if self.has_todo or self.has_progress:
+            score += 10
+
+        # Recent activity (0-20 pts)
+        if self.last_activity:
+            from datetime import timedelta
+            days_ago = (datetime.utcnow() - self.last_activity).days
+            if days_ago <= 7:
+                score += 20
+            elif days_ago <= 14:
+                score += 15
+            elif days_ago <= 30:
+                score += 10
+            elif days_ago <= 60:
+                score += 5
+
+        # No pending decisions (10 pts)
+        if not self.has_pending_decision:
+            score += 10
+
+        # Clean git state (10 pts)
+        if not self.git_dirty:
+            score += 10
+
+        # Known project type (10 pts)
+        if self.project_type and self.project_type != 'generic':
+            score += 10
+
+        return min(score, 100)
+
 
 class ProgressItem(Base):
     """Individual progress/todo item."""

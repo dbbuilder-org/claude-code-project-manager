@@ -59,6 +59,9 @@ class ProjectDetector:
         'target', '.idea', '.vscode', '.archive'
     }
 
+    # Container folders that hold multiple projects (scan recursively)
+    CONTAINER_FOLDERS = {'clients'}
+
     def __init__(self, base_path: str | Path):
         self.base_path = Path(base_path).resolve()
 
@@ -68,13 +71,32 @@ class ProjectDetector:
 
         for item in self.base_path.iterdir():
             if item.is_dir() and item.name not in self.SKIP_DIRS and not item.name.startswith('.'):
-                project = self._detect_project(item)
-                if project:
-                    projects.append(project)
+                # Check if this is a container folder (like 'clients')
+                if item.name.lower() in self.CONTAINER_FOLDERS:
+                    # Scan inside container folder
+                    container_projects = self._scan_container(item)
+                    projects.extend(container_projects)
+                else:
+                    project = self._detect_project(item)
+                    if project:
+                        projects.append(project)
 
         return sorted(projects, key=lambda p: p.name.lower())
 
-    def _detect_project(self, path: Path) -> Optional[ProjectInfo]:
+    def _scan_container(self, container_path: Path) -> list[ProjectInfo]:
+        """Scan a container folder (like clients/) for sub-projects."""
+        projects = []
+        container_name = container_path.name.lower()
+
+        for item in container_path.iterdir():
+            if item.is_dir() and item.name not in self.SKIP_DIRS and not item.name.startswith('.'):
+                project = self._detect_project(item, parent_container=container_name)
+                if project:
+                    projects.append(project)
+
+        return projects
+
+    def _detect_project(self, path: Path, parent_container: Optional[str] = None) -> Optional[ProjectInfo]:
         """Detect if a directory is a valid project."""
         if not path.is_dir():
             return None
@@ -85,7 +107,7 @@ class ProjectDetector:
             return None
 
         # Determine category (client vs internal)
-        category = self._detect_category(path)
+        category = self._detect_category(path, parent_container)
 
         # Create project info
         project = ProjectInfo(
@@ -124,9 +146,13 @@ class ProjectDetector:
                         return ptype
         return None
 
-    def _detect_category(self, path: Path) -> str:
+    def _detect_category(self, path: Path, parent_container: Optional[str] = None) -> str:
         """Detect if project is client, internal, or tool."""
-        # Check if under clients directory
+        # If we know the parent container, use it directly
+        if parent_container == 'clients':
+            return 'client'
+
+        # Check if under clients directory (fallback)
         try:
             path.relative_to(self.base_path / 'clients')
             return 'client'
