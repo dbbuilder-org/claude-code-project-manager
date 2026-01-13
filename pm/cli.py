@@ -687,5 +687,248 @@ def health(filter_str: Optional[str], limit: int, asc: bool):
     session.close()
 
 
+@main.command()
+@click.argument("project_name")
+@click.option("--notes", "-n", help="Set project notes/commentary")
+@click.option("--deadline", "-d", help="Set deadline (YYYY-MM-DD)")
+@click.option("--target", "-t", help="Set target date (YYYY-MM-DD)")
+@click.option("--priority", "-p", type=click.Choice(["1", "2", "3", "4", "5"]),
+              help="Set priority: 1=critical, 2=high, 3=normal, 4=low, 5=someday")
+@click.option("--tags", help="Set tags (comma-separated)")
+@click.option("--client", help="Set client name")
+@click.option("--budget", type=float, help="Set budget hours")
+@click.option("--hours", type=float, help="Log hours spent")
+@click.option("--archive/--unarchive", default=None, help="Archive/unarchive project")
+@click.option("--show", "-s", is_flag=True, help="Show current metadata")
+def edit(project_name: str, notes: Optional[str], deadline: Optional[str],
+         target: Optional[str], priority: Optional[str], tags: Optional[str],
+         client: Optional[str], budget: Optional[float], hours: Optional[float],
+         archive: Optional[bool], show: bool):
+    """Edit project metadata (notes, deadlines, priority, etc.)."""
+    init_db()
+    session = get_session()
+
+    # Find project
+    project = session.query(Project).filter(
+        Project.name.ilike(f"%{project_name}%")
+    ).first()
+
+    if not project:
+        console.print(f"[red]Project '{project_name}' not found[/red]")
+        session.close()
+        return
+
+    # Show current metadata
+    if show or all(x is None for x in [notes, deadline, target, priority, tags, client, budget, hours, archive]):
+        console.print(Panel(f"[bold]{project.name}[/bold]", subtitle=project.path))
+
+        table = Table(box=box.SIMPLE)
+        table.add_column("Field", style="cyan")
+        table.add_column("Value")
+
+        table.add_row("Priority", f"{project.priority_label} ({project.priority})")
+        table.add_row("Deadline", str(project.deadline.date()) if project.deadline else "—")
+        table.add_row("Target Date", str(project.target_date.date()) if project.target_date else "—")
+        table.add_row("Days to Deadline", str(project.days_until_deadline) if project.days_until_deadline else "—")
+        table.add_row("Urgency Score", str(project.urgency_score))
+        table.add_row("Client", project.client_name or "—")
+        table.add_row("Budget Hours", f"{project.budget_hours:.1f}" if project.budget_hours else "—")
+        table.add_row("Hours Logged", f"{project.hours_logged:.1f}" if project.hours_logged else "0")
+        table.add_row("Tags", ", ".join(project.tags_list) if project.tags_list else "—")
+        table.add_row("Archived", "Yes" if project.archived else "No")
+        table.add_row("Notes", project.notes[:100] + "..." if project.notes and len(project.notes) > 100 else (project.notes or "—"))
+
+        console.print(table)
+
+        if not any([notes, deadline, target, priority, tags, client, budget, hours, archive is not None]):
+            console.print("\n[dim]Use options to update: --notes, --deadline, --priority, etc.[/dim]")
+            session.close()
+            return
+
+    # Update fields
+    updated = []
+
+    if notes is not None:
+        project.notes = notes
+        updated.append("notes")
+
+    if deadline is not None:
+        try:
+            project.deadline = datetime.strptime(deadline, "%Y-%m-%d")
+            updated.append("deadline")
+        except ValueError:
+            console.print(f"[red]Invalid date format: {deadline}. Use YYYY-MM-DD[/red]")
+
+    if target is not None:
+        try:
+            project.target_date = datetime.strptime(target, "%Y-%m-%d")
+            updated.append("target_date")
+        except ValueError:
+            console.print(f"[red]Invalid date format: {target}. Use YYYY-MM-DD[/red]")
+
+    if priority is not None:
+        project.priority = int(priority)
+        updated.append("priority")
+
+    if tags is not None:
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+        project.tags = json.dumps(tag_list)
+        updated.append("tags")
+
+    if client is not None:
+        project.client_name = client
+        updated.append("client_name")
+
+    if budget is not None:
+        project.budget_hours = budget
+        updated.append("budget_hours")
+
+    if hours is not None:
+        project.hours_logged = (project.hours_logged or 0) + hours
+        updated.append(f"hours_logged (+{hours})")
+
+    if archive is not None:
+        project.archived = archive
+        updated.append("archived" if archive else "unarchived")
+
+    if updated:
+        session.commit()
+        console.print(f"[green]✓ Updated {project.name}:[/green] {', '.join(updated)}")
+
+    session.close()
+
+
+@main.command()
+@click.option("--filter", "-f", "filter_str", help="Filter: type:client, priority:1, overdue, tagged:foo")
+@click.option("--limit", "-n", default=20, help="Limit results")
+def urgent(filter_str: Optional[str], limit: int):
+    """Show projects by urgency (deadlines + priority)."""
+    init_db()
+    session = get_session()
+
+    query = session.query(Project).filter(Project.archived == False)
+
+    # Apply filters
+    if filter_str:
+        if filter_str.startswith("type:"):
+            category = filter_str.split(":")[1]
+            query = query.filter(Project.category == category)
+        elif filter_str.startswith("priority:"):
+            p = int(filter_str.split(":")[1])
+            query = query.filter(Project.priority == p)
+        elif filter_str == "overdue":
+            query = query.filter(Project.deadline < datetime.utcnow())
+        elif filter_str.startswith("tagged:"):
+            tag = filter_str.split(":")[1]
+            query = query.filter(Project.tags.ilike(f"%{tag}%"))
+
+    projects = query.all()
+
+    # Sort by urgency
+    projects_sorted = sorted(projects, key=lambda p: p.urgency_score, reverse=True)
+    if limit > 0:
+        projects_sorted = projects_sorted[:limit]
+
+    if not projects_sorted:
+        console.print("[yellow]No urgent projects found[/yellow]")
+        session.close()
+        return
+
+    table = Table(title="Urgent Projects (by deadline & priority)", box=box.ROUNDED)
+    table.add_column("Project")
+    table.add_column("Priority")
+    table.add_column("Deadline")
+    table.add_column("Days Left")
+    table.add_column("Urgency")
+    table.add_column("Progress")
+    table.add_column("Notes")
+
+    for p in projects_sorted:
+        # Priority styling
+        priority_colors = {1: "red bold", 2: "yellow", 3: "white", 4: "dim", 5: "dim"}
+        priority_style = priority_colors.get(p.priority, "white")
+
+        # Deadline styling
+        days = p.days_until_deadline
+        if days is not None:
+            if days < 0:
+                deadline_str = f"[red bold]OVERDUE ({abs(days)}d)[/red bold]"
+            elif days <= 3:
+                deadline_str = f"[red]{p.deadline.strftime('%m/%d')}[/red]"
+            elif days <= 7:
+                deadline_str = f"[yellow]{p.deadline.strftime('%m/%d')}[/yellow]"
+            else:
+                deadline_str = p.deadline.strftime("%m/%d")
+            days_str = str(days) if days >= 0 else f"[red]{days}[/red]"
+        else:
+            deadline_str = "—"
+            days_str = "—"
+
+        # Urgency bar
+        urgency = p.urgency_score
+        bar_filled = int(urgency / 10)
+        bar = f"[red]{'█' * bar_filled}[/red][dim]{'░' * (10 - bar_filled)}[/dim] {urgency}"
+
+        # Progress
+        prog = f"{p.completion_pct:.0f}%" if p.completion_pct else "—"
+
+        # Notes preview
+        notes_preview = (p.notes[:30] + "...") if p.notes and len(p.notes) > 30 else (p.notes or "—")
+
+        table.add_row(
+            p.name,
+            f"[{priority_style}]{p.priority_label}[/{priority_style}]",
+            deadline_str,
+            days_str,
+            bar,
+            prog,
+            notes_preview,
+        )
+
+    console.print(table)
+    session.close()
+
+
+@main.command()
+@click.option("--limit", "-n", default=0, help="Limit results (0 = no limit)")
+def backlog(limit: int):
+    """Show someday/maybe projects (priority 5) and archived."""
+    init_db()
+    session = get_session()
+
+    # Someday projects
+    query = session.query(Project).filter(
+        (Project.priority == 5) | (Project.archived == True)
+    ).order_by(Project.name)
+
+    if limit > 0:
+        query = query.limit(limit)
+
+    projects = query.all()
+
+    if not projects:
+        console.print("[green]No backlog projects[/green]")
+        session.close()
+        return
+
+    table = Table(title="Backlog / Someday Projects", box=box.SIMPLE)
+    table.add_column("Project")
+    table.add_column("Status")
+    table.add_column("Category")
+    table.add_column("Progress")
+    table.add_column("Notes")
+
+    for p in projects:
+        status = "[dim]Archived[/dim]" if p.archived else "[cyan]Someday[/cyan]"
+        prog = f"{p.completion_pct:.0f}%" if p.completion_pct else "—"
+        notes = (p.notes[:40] + "...") if p.notes and len(p.notes) > 40 else (p.notes or "—")
+
+        table.add_row(p.name, status, p.category, prog, notes)
+
+    console.print(table)
+    console.print(f"\n[dim]Total: {len(projects)} projects in backlog[/dim]")
+    session.close()
+
+
 if __name__ == "__main__":
     main()

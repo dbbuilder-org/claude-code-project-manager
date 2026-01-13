@@ -43,9 +43,74 @@ class Project(Base):
     has_progress = Column(Boolean, default=False)
     progress_files = Column(Text)  # JSON list
 
+    # PM metadata (user-editable)
+    notes = Column(Text)  # Free-form commentary
+    deadline = Column(DateTime)  # Hard deadline
+    target_date = Column(DateTime)  # Target completion date
+    priority = Column(Integer, default=3)  # 1=critical, 2=high, 3=normal, 4=low, 5=someday
+    tags = Column(Text)  # JSON list of tags
+    client_name = Column(String)  # Client attribution
+    budget_hours = Column(Float)  # Estimated hours
+    hours_logged = Column(Float, default=0)  # Hours spent
+    archived = Column(Boolean, default=False)  # Hide from active lists
+
     # Relationships
     items = relationship("ProgressItem", back_populates="project", cascade="all, delete-orphan")
     history = relationship("ScanHistory", back_populates="project", cascade="all, delete-orphan")
+
+    @property
+    def days_until_deadline(self) -> Optional[int]:
+        """Days until deadline (negative if overdue)."""
+        if self.deadline:
+            return (self.deadline - datetime.utcnow()).days
+        return None
+
+    @property
+    def days_until_target(self) -> Optional[int]:
+        """Days until target date (negative if past)."""
+        if self.target_date:
+            return (self.target_date - datetime.utcnow()).days
+        return None
+
+    @property
+    def is_overdue(self) -> bool:
+        """Check if project is past deadline."""
+        return self.days_until_deadline is not None and self.days_until_deadline < 0
+
+    @property
+    def urgency_score(self) -> int:
+        """Calculate urgency based on deadline/priority (0-100, higher = more urgent)."""
+        score = 0
+
+        # Priority boost (1=critical adds 40, 5=someday adds 0)
+        if self.priority:
+            score += max(0, (6 - self.priority) * 10)
+
+        # Deadline urgency
+        days = self.days_until_deadline
+        if days is not None:
+            if days < 0:  # Overdue
+                score += 50
+            elif days <= 3:
+                score += 40
+            elif days <= 7:
+                score += 30
+            elif days <= 14:
+                score += 20
+            elif days <= 30:
+                score += 10
+
+        # Target date urgency (softer)
+        target_days = self.days_until_target
+        if target_days is not None and days is None:  # Only if no deadline
+            if target_days < 0:
+                score += 20
+            elif target_days <= 7:
+                score += 15
+            elif target_days <= 14:
+                score += 10
+
+        return min(score, 100)
 
     @property
     def health_score(self) -> int:
@@ -76,7 +141,6 @@ class Project(Base):
 
         # Recent activity (0-20 pts)
         if self.last_activity:
-            from datetime import timedelta
             days_ago = (datetime.utcnow() - self.last_activity).days
             if days_ago <= 7:
                 score += 20
@@ -100,6 +164,23 @@ class Project(Base):
             score += 10
 
         return min(score, 100)
+
+    @property
+    def priority_label(self) -> str:
+        """Human-readable priority label."""
+        labels = {1: "Critical", 2: "High", 3: "Normal", 4: "Low", 5: "Someday"}
+        return labels.get(self.priority, "Normal")
+
+    @property
+    def tags_list(self) -> list[str]:
+        """Parse tags JSON to list."""
+        if self.tags:
+            import json
+            try:
+                return json.loads(self.tags)
+            except:
+                return []
+        return []
 
 
 class ProgressItem(Base):
@@ -141,6 +222,36 @@ _engine = None
 _SessionLocal = None
 
 
+def _migrate_db(engine) -> None:
+    """Add missing columns to existing tables."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    existing_columns = {c['name'] for c in inspector.get_columns('projects')}
+
+    # New columns to add with their SQLite types
+    new_columns = [
+        ("notes", "TEXT"),
+        ("deadline", "DATETIME"),
+        ("target_date", "DATETIME"),
+        ("priority", "INTEGER DEFAULT 3"),
+        ("tags", "TEXT"),
+        ("client_name", "VARCHAR"),
+        ("budget_hours", "FLOAT"),
+        ("hours_logged", "FLOAT DEFAULT 0"),
+        ("archived", "BOOLEAN DEFAULT 0"),
+    ]
+
+    with engine.connect() as conn:
+        for col_name, col_type in new_columns:
+            if col_name not in existing_columns:
+                try:
+                    conn.execute(text(f"ALTER TABLE projects ADD COLUMN {col_name} {col_type}"))
+                    conn.commit()
+                except Exception:
+                    pass  # Column might already exist
+
+
 def init_db(db_path: Optional[Path] = None) -> None:
     """Initialize the database."""
     global _engine, _SessionLocal
@@ -152,6 +263,7 @@ def init_db(db_path: Optional[Path] = None) -> None:
 
     _engine = create_engine(f"sqlite:///{db_path}", echo=False)
     Base.metadata.create_all(_engine)
+    _migrate_db(_engine)  # Add missing columns
     _SessionLocal = sessionmaker(bind=_engine)
 
 

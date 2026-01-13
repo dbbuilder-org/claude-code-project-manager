@@ -57,10 +57,13 @@ if "selected_projects" not in st.session_state:
     st.session_state.selected_projects = set()
 
 
-def get_projects_data():
+def get_projects_data(include_archived: bool = False):
     """Load projects with health scores."""
     session = get_session()
-    projects = session.query(Project).all()
+    query = session.query(Project)
+    if not include_archived:
+        query = query.filter((Project.archived == False) | (Project.archived == None))
+    projects = query.all()
 
     data = []
     for p in projects:
@@ -77,6 +80,7 @@ def get_projects_data():
             "type": p.project_type,
             "completion": p.completion_pct or 0,
             "health": p.health_score,
+            "urgency": p.urgency_score,
             "phase": p.current_phase or "",
             "status": p.current_status or "",
             "next_action": p.next_action or "",
@@ -88,10 +92,38 @@ def get_projects_data():
             "last_scanned": p.last_scanned,
             "has_claude_md": p.has_claude_md,
             "has_todo": p.has_todo,
+            # PM metadata
+            "priority": p.priority or 3,
+            "priority_label": p.priority_label,
+            "deadline": p.deadline,
+            "target_date": p.target_date,
+            "days_to_deadline": p.days_until_deadline,
+            "is_overdue": p.is_overdue,
+            "notes": p.notes or "",
+            "tags": p.tags_list,
+            "client_name": p.client_name or "",
+            "budget_hours": p.budget_hours,
+            "hours_logged": p.hours_logged or 0,
+            "archived": p.archived or False,
         })
 
     session.close()
     return pd.DataFrame(data)
+
+
+def update_project_metadata(name: str, **kwargs):
+    """Update project metadata in database."""
+    import json
+    session = get_session()
+    project = session.query(Project).filter(Project.name == name).first()
+    if project:
+        for key, value in kwargs.items():
+            if key == "tags" and isinstance(value, list):
+                value = json.dumps(value)
+            if hasattr(project, key):
+                setattr(project, key, value)
+        session.commit()
+    session.close()
 
 
 def open_in_vscode(path: str):
@@ -270,11 +302,13 @@ def main():
                 st.rerun()
 
     # Main content tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "📋 All Projects",
+        "🔥 Urgent",
         "🎯 Work Queue",
         "⚠️ Decisions",
         "🟢 Clients",
+        "✏️ Edit",
         "📊 Analytics"
     ])
 
@@ -282,19 +316,25 @@ def main():
         render_project_list(df)
 
     with tab2:
-        render_work_queue(df)
+        render_urgent(df)
 
     with tab3:
-        render_decisions(df)
+        render_work_queue(df)
 
     with tab4:
+        render_decisions(df)
+
+    with tab5:
         client_df = df[df["category"] == "client"]
         if len(client_df) > 0:
             render_project_list(client_df, show_category=False)
         else:
             st.info("No client projects found")
 
-    with tab5:
+    with tab6:
+        render_edit_metadata(df)
+
+    with tab7:
         render_analytics(df)
 
 
@@ -358,6 +398,177 @@ def render_work_queue(df: pd.DataFrame):
 
                 if st.button("💻 Terminal", key=f"wq_term_{idx}"):
                     open_in_terminal(row["path"])
+
+
+def render_urgent(df: pd.DataFrame):
+    """Render urgent projects by deadline and priority."""
+    st.subheader("🔥 Urgent Projects")
+    st.caption("Sorted by urgency score (deadlines + priority)")
+
+    # Sort by urgency
+    urgent_df = df.sort_values("urgency", ascending=False)
+
+    # Show overdue first
+    overdue = urgent_df[urgent_df["is_overdue"] == True]
+    if len(overdue) > 0:
+        st.error(f"🚨 {len(overdue)} OVERDUE projects!")
+        for idx, row in overdue.iterrows():
+            days = abs(row["days_to_deadline"])
+            with st.expander(f"🔴 {row['name']} — OVERDUE by {days} days"):
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.markdown(f"**Deadline:** {row['deadline'].strftime('%Y-%m-%d')}")
+                    st.markdown(f"**Priority:** {row['priority_label']}")
+                    if row["notes"]:
+                        st.markdown(f"**Notes:** {row['notes']}")
+                with col2:
+                    if st.button("🚀 Claude", key=f"urg_claude_{idx}"):
+                        launch_claude_code(row["path"], row["name"])
+
+    # Show upcoming deadlines
+    upcoming = urgent_df[
+        (urgent_df["days_to_deadline"].notna()) &
+        (urgent_df["days_to_deadline"] >= 0) &
+        (urgent_df["days_to_deadline"] <= 14)
+    ]
+    if len(upcoming) > 0:
+        st.warning(f"⏰ {len(upcoming)} projects due within 2 weeks")
+        for idx, row in upcoming.iterrows():
+            days = row["days_to_deadline"]
+            urgency_color = "🔴" if days <= 3 else "🟡" if days <= 7 else "🟢"
+            with st.expander(f"{urgency_color} {row['name']} — {days} days left"):
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.markdown(f"**Deadline:** {row['deadline'].strftime('%Y-%m-%d')}")
+                    st.markdown(f"**Priority:** {row['priority_label']}")
+                    st.markdown(f"**Progress:** {row['completion']:.0f}%")
+                    if row["notes"]:
+                        st.markdown(f"**Notes:** {row['notes']}")
+                with col2:
+                    if st.button("🚀 Claude", key=f"upc_claude_{idx}"):
+                        launch_claude_code(row["path"], row["name"])
+
+    # Show high priority without deadlines
+    high_priority = urgent_df[
+        (urgent_df["priority"] <= 2) &
+        (urgent_df["deadline"].isna())
+    ]
+    if len(high_priority) > 0:
+        st.info(f"⭐ {len(high_priority)} high priority projects (no deadline set)")
+        for idx, row in high_priority.head(10).iterrows():
+            priority_icon = "🔴" if row["priority"] == 1 else "🟡"
+            with st.expander(f"{priority_icon} {row['name']} — {row['priority_label']}"):
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.markdown(f"**Category:** {row['category']}")
+                    st.markdown(f"**Progress:** {row['completion']:.0f}%")
+                    if row["notes"]:
+                        st.markdown(f"**Notes:** {row['notes']}")
+                with col2:
+                    if st.button("🚀 Claude", key=f"hp_claude_{idx}"):
+                        launch_claude_code(row["path"], row["name"])
+
+
+def render_edit_metadata(df: pd.DataFrame):
+    """Render metadata editing interface."""
+    st.subheader("✏️ Edit Project Metadata")
+
+    # Project selector
+    project_names = sorted(df["name"].tolist())
+    selected_project = st.selectbox("Select Project", [""] + project_names)
+
+    if not selected_project:
+        st.info("Select a project to edit its metadata")
+        return
+
+    row = df[df["name"] == selected_project].iloc[0]
+
+    st.markdown(f"**Path:** `{row['path']}`")
+    st.markdown(f"**Category:** {row['category']} | **Type:** {row['type']}")
+
+    st.markdown("---")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        # Priority
+        priority_options = {
+            "1 - Critical": 1,
+            "2 - High": 2,
+            "3 - Normal": 3,
+            "4 - Low": 4,
+            "5 - Someday": 5
+        }
+        current_priority = [k for k, v in priority_options.items() if v == row["priority"]][0]
+        new_priority = st.selectbox("Priority", list(priority_options.keys()),
+                                     index=list(priority_options.keys()).index(current_priority))
+
+        # Deadline
+        current_deadline = row["deadline"].date() if pd.notna(row["deadline"]) else None
+        new_deadline = st.date_input("Deadline", value=current_deadline)
+
+        # Target date
+        current_target = row["target_date"].date() if pd.notna(row["target_date"]) else None
+        new_target = st.date_input("Target Date", value=current_target)
+
+    with col2:
+        # Client name
+        new_client = st.text_input("Client Name", value=row["client_name"])
+
+        # Budget hours
+        new_budget = st.number_input("Budget Hours", value=row["budget_hours"] or 0.0, min_value=0.0)
+
+        # Hours logged
+        new_hours = st.number_input("Hours Logged", value=row["hours_logged"] or 0.0, min_value=0.0)
+
+    # Tags
+    current_tags = ", ".join(row["tags"]) if row["tags"] else ""
+    new_tags = st.text_input("Tags (comma-separated)", value=current_tags)
+
+    # Notes
+    new_notes = st.text_area("Notes / Commentary", value=row["notes"], height=150)
+
+    # Archive toggle
+    new_archived = st.checkbox("Archived", value=row["archived"])
+
+    # Save button
+    if st.button("💾 Save Changes", type="primary"):
+        updates = {}
+
+        if priority_options[new_priority] != row["priority"]:
+            updates["priority"] = priority_options[new_priority]
+
+        if new_deadline != current_deadline:
+            updates["deadline"] = datetime.combine(new_deadline, datetime.min.time()) if new_deadline else None
+
+        if new_target != current_target:
+            updates["target_date"] = datetime.combine(new_target, datetime.min.time()) if new_target else None
+
+        if new_client != row["client_name"]:
+            updates["client_name"] = new_client
+
+        if new_budget != (row["budget_hours"] or 0.0):
+            updates["budget_hours"] = new_budget
+
+        if new_hours != (row["hours_logged"] or 0.0):
+            updates["hours_logged"] = new_hours
+
+        new_tags_list = [t.strip() for t in new_tags.split(",") if t.strip()]
+        if new_tags_list != row["tags"]:
+            updates["tags"] = new_tags_list
+
+        if new_notes != row["notes"]:
+            updates["notes"] = new_notes
+
+        if new_archived != row["archived"]:
+            updates["archived"] = new_archived
+
+        if updates:
+            update_project_metadata(selected_project, **updates)
+            st.success(f"✓ Updated: {', '.join(updates.keys())}")
+            st.rerun()
+        else:
+            st.info("No changes to save")
 
 
 def render_decisions(df: pd.DataFrame):
