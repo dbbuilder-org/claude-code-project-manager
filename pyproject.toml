@@ -36,9 +36,10 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=long --cov=pm --cov-report=term-missing"
 filterwarnings = [
     "ignore::DeprecationWarning",
+    "ignore::ResourceWarning",
 ]
 
 [tool.coverage.run]
