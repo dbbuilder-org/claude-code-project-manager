@@ -17,6 +17,7 @@ from .scanner.detector import ProjectDetector, ProjectInfo
 from .scanner.parser import ProgressParser, ProjectProgress, ItemStatus
 from .generator.prompts import ContinuePromptGenerator, PromptMode
 from .database.models import init_db, get_session, Project, ProgressItem, ScanHistory
+from .metadata import read_pm_status, sync_to_file, PM_STATUS_FILENAME
 
 
 console = Console()
@@ -103,6 +104,29 @@ def scan(base_path: str, verbose: bool):
             proj.has_todo = proj_info.has_todo
             proj.has_progress = proj_info.has_progress
             proj.progress_files = json.dumps(proj_info.progress_files)
+
+            # Read PM-STATUS.md metadata (if exists)
+            pm_meta = read_pm_status(proj_info.path)
+            if pm_meta:
+                # Only update if values are set in file (don't overwrite with defaults)
+                if pm_meta.priority != 3:  # Non-default priority
+                    proj.priority = pm_meta.priority
+                if pm_meta.deadline:
+                    proj.deadline = pm_meta.deadline
+                if pm_meta.target_date:
+                    proj.target_date = pm_meta.target_date
+                if pm_meta.tags:
+                    proj.tags = json.dumps(pm_meta.tags)
+                if pm_meta.client_name:
+                    proj.client_name = pm_meta.client_name
+                if pm_meta.budget_hours:
+                    proj.budget_hours = pm_meta.budget_hours
+                if pm_meta.hours_logged:
+                    proj.hours_logged = pm_meta.hours_logged
+                if pm_meta.archived:
+                    proj.archived = pm_meta.archived
+                if pm_meta.notes:
+                    proj.notes = pm_meta.notes
 
             # Track category stats
             stats[proj_info.category] = stats.get(proj_info.category, 0) + 1
@@ -700,11 +724,16 @@ def health(filter_str: Optional[str], limit: int, asc: bool):
 @click.option("--hours", type=float, help="Log hours spent")
 @click.option("--archive/--unarchive", default=None, help="Archive/unarchive project")
 @click.option("--show", "-s", is_flag=True, help="Show current metadata")
+@click.option("--sync/--no-sync", default=True, help="Sync changes to PM-STATUS.md file")
 def edit(project_name: str, notes: Optional[str], deadline: Optional[str],
          target: Optional[str], priority: Optional[str], tags: Optional[str],
          client: Optional[str], budget: Optional[float], hours: Optional[float],
-         archive: Optional[bool], show: bool):
-    """Edit project metadata (notes, deadlines, priority, etc.)."""
+         archive: Optional[bool], show: bool, sync: bool):
+    """Edit project metadata (notes, deadlines, priority, etc.).
+
+    Changes are synced to PM-STATUS.md in the project folder by default.
+    Use --no-sync to only update the database.
+    """
     init_db()
     session = get_session()
 
@@ -738,10 +767,15 @@ def edit(project_name: str, notes: Optional[str], deadline: Optional[str],
         table.add_row("Archived", "Yes" if project.archived else "No")
         table.add_row("Notes", project.notes[:100] + "..." if project.notes and len(project.notes) > 100 else (project.notes or "—"))
 
+        # Check for PM-STATUS.md file
+        pm_file = Path(project.path) / PM_STATUS_FILENAME
+        table.add_row("PM-STATUS.md", "[green]exists[/green]" if pm_file.exists() else "[dim]not created[/dim]")
+
         console.print(table)
 
         if not any([notes, deadline, target, priority, tags, client, budget, hours, archive is not None]):
             console.print("\n[dim]Use options to update: --notes, --deadline, --priority, etc.[/dim]")
+            console.print(f"[dim]Changes sync to {PM_STATUS_FILENAME} by default (--no-sync to disable)[/dim]")
             session.close()
             return
 
@@ -794,6 +828,25 @@ def edit(project_name: str, notes: Optional[str], deadline: Optional[str],
     if updated:
         session.commit()
         console.print(f"[green]✓ Updated {project.name}:[/green] {', '.join(updated)}")
+
+        # Sync to PM-STATUS.md file
+        if sync:
+            from .metadata import ProjectMetadata
+            meta = ProjectMetadata(
+                priority=project.priority or 3,
+                deadline=project.deadline,
+                target_date=project.target_date,
+                tags=project.tags_list,
+                client_name=project.client_name,
+                budget_hours=project.budget_hours,
+                hours_logged=project.hours_logged or 0,
+                archived=project.archived or False,
+                notes=project.notes or "",
+            )
+            if sync_to_file(Path(project.path), **vars(meta)):
+                console.print(f"[green]✓ Synced to[/green] {PM_STATUS_FILENAME}")
+            else:
+                console.print(f"[yellow]⚠ Could not write {PM_STATUS_FILENAME}[/yellow]")
 
     session.close()
 
@@ -928,6 +981,339 @@ def backlog(limit: int):
     console.print(table)
     console.print(f"\n[dim]Total: {len(projects)} projects in backlog[/dim]")
     session.close()
+
+
+@main.command()
+@click.argument("target", default="10")
+@click.option("--dirty-only", "-d", is_flag=True, help="Only projects with uncommitted changes")
+@click.option("--dry-run", is_flag=True, help="Show what would be launched without launching")
+def launch(target: str, dirty_only: bool, dry_run: bool):
+    """Launch Claude Code for projects.
+
+    TARGET can be:
+    - A number: Launch the N most recently modified projects
+    - A project name: Launch that specific project
+
+    Opens iTerm2 tabs with Claude Code using --dangerously-skip-permissions --continue.
+
+    Examples:
+        pm launch              # Launch top 10 most recent
+        pm launch 5            # Launch top 5 most recent
+        pm launch myproject    # Launch specific project by name
+        pm launch -d           # Only projects with uncommitted changes
+    """
+    init_db()
+    session = get_session()
+
+    # Check if target is a number or project name
+    try:
+        count = int(target)
+        # It's a number - launch top N
+        query = session.query(Project).filter(
+            (Project.archived == False) | (Project.archived == None)
+        ).order_by(Project.last_activity.desc().nullslast())
+
+        if dirty_only:
+            query = query.filter(Project.git_dirty == True)
+
+        projects = query.limit(count).all()
+    except ValueError:
+        # It's a project name - find and launch it
+        project = session.query(Project).filter(
+            Project.name.ilike(f"%{target}%")
+        ).first()
+
+        if not project:
+            console.print(f"[red]Project '{target}' not found[/red]")
+            session.close()
+            return
+
+        projects = [project]
+
+    if not projects:
+        console.print("[yellow]No projects found matching criteria[/yellow]")
+        session.close()
+        return
+
+    # Display what we're launching
+    table = Table(title=f"Launching {len(projects)} Projects", box=box.SIMPLE)
+    table.add_column("#", style="dim")
+    table.add_column("Project")
+    table.add_column("Last Activity")
+    table.add_column("Status")
+    table.add_column("Path")
+
+    for i, p in enumerate(projects, 1):
+        activity = p.last_activity.strftime("%Y-%m-%d %H:%M") if p.last_activity else "—"
+        status_parts = []
+        if p.git_dirty:
+            status_parts.append("[yellow]●[/yellow]")
+        if p.has_pending_decision:
+            status_parts.append("[red]⚠[/red]")
+        status = " ".join(status_parts) or "[green]✓[/green]"
+
+        table.add_row(str(i), p.name, activity, status, str(p.path))
+
+    console.print(table)
+
+    if dry_run:
+        console.print("\n[dim]Dry run - no terminals opened[/dim]")
+        session.close()
+        return
+
+    # Launch each project in iTerm2
+    console.print(f"\n[bold blue]Opening {len(projects)} iTerm2 tabs...[/bold blue]")
+
+    for i, p in enumerate(projects):
+        # AppleScript to open new iTerm tab and run claude
+        script = f'''
+        tell application "iTerm"
+            activate
+            tell current window
+                create tab with default profile
+                tell current session
+                    write text "cd '{p.path}' && transcript && claude --dangerously-skip-permissions --continue"
+                end tell
+            end tell
+        end tell
+        '''
+
+        try:
+            subprocess.run(["osascript", "-e", script], check=True, capture_output=True)
+            console.print(f"  [green]✓[/green] {p.name}")
+        except subprocess.CalledProcessError as e:
+            console.print(f"  [red]✗[/red] {p.name}: {e}")
+
+        # Small delay to prevent overwhelming iTerm
+        if i < len(projects) - 1:
+            import time
+            time.sleep(0.3)
+
+    console.print(f"\n[bold green]Launched {len(projects)} Claude Code sessions[/bold green]")
+    session.close()
+
+
+@main.command()
+@click.option("--no-context", is_flag=True, help="Skip writing context docs before shutdown")
+@click.option("--dry-run", is_flag=True, help="Show what would be done without executing")
+@click.option("--context-wait", default=60, help="Seconds to wait after context command (default: 60)")
+def shutdown(no_context: bool, dry_run: bool, context_wait: int):
+    """Gracefully shutdown all Claude Code sessions in iTerm2.
+
+    For each iTerm2 tab:
+    1. Send 'write context to docs/PROJECT-CONTEXT.md' (unless --no-context)
+    2. Wait for context to be written (default 60s)
+    3. Send '/exit' to close Claude
+    4. Wait 5 seconds
+    5. Close the tab
+
+    Sessions are processed in parallel with 2 second stagger.
+
+    Examples:
+        pm shutdown              # Graceful shutdown with context save
+        pm shutdown --no-context # Quick shutdown, skip context
+        pm shutdown --dry-run    # Preview what would happen
+    """
+    import threading
+    import time
+
+    # AppleScript to get all iTerm2 tab info
+    get_tabs_script = '''
+    tell application "iTerm"
+        set tabList to {}
+        repeat with w in windows
+            repeat with t in tabs of w
+                repeat with s in sessions of t
+                    set sessionName to name of s
+                    set end of tabList to {windowId:id of w, tabIndex:(index of t), sessionId:id of s, sessionName:sessionName}
+                end repeat
+            end repeat
+        end repeat
+        return tabList
+    end tell
+    '''
+
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", get_tabs_script],
+            capture_output=True, text=True, check=True
+        )
+        raw_output = result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]Failed to get iTerm2 tabs: {e}[/red]")
+        return
+
+    # Parse the AppleScript output to find Claude sessions
+    # Look for tabs that likely have Claude running (name contains 'claude' or project path)
+    console.print("[bold blue]Scanning iTerm2 for Claude Code sessions...[/bold blue]")
+
+    # Get list of windows/tabs via simpler approach
+    count_script = '''
+    tell application "iTerm"
+        set sessionCount to 0
+        repeat with w in windows
+            repeat with t in tabs of w
+                set sessionCount to sessionCount + (count of sessions of t)
+            end repeat
+        end repeat
+        return sessionCount
+    end tell
+    '''
+
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", count_script],
+            capture_output=True, text=True, check=True
+        )
+        session_count = int(result.stdout.strip())
+    except (subprocess.CalledProcessError, ValueError):
+        session_count = 0
+
+    if session_count == 0:
+        console.print("[yellow]No iTerm2 sessions found[/yellow]")
+        return
+
+    console.print(f"Found [cyan]{session_count}[/cyan] iTerm2 sessions")
+
+    if dry_run:
+        console.print("\n[dim]Dry run - would perform:[/dim]")
+        if not no_context:
+            console.print(f"  1. Send 'write context to docs/PROJECT-CONTEXT.md' to each session")
+            console.print(f"  2. Wait {context_wait} seconds for context to be written")
+        console.print("  3. Send '/exit' to close Claude")
+        console.print("  4. Wait 5 seconds")
+        console.print("  5. Close each tab")
+        console.print(f"\n[dim]Sessions would be processed in parallel with 2s stagger[/dim]")
+        return
+
+    # Confirm with user
+    if not click.confirm(f"Shutdown {session_count} sessions?", default=True):
+        console.print("[yellow]Cancelled[/yellow]")
+        return
+
+    def shutdown_session(window_idx: int, tab_idx: int, session_idx: int, delay: float):
+        """Shutdown a single session with the specified delay before starting."""
+        time.sleep(delay)
+
+        session_id = f"w{window_idx}t{tab_idx}s{session_idx}"
+        console.print(f"  [cyan]Starting shutdown:[/cyan] {session_id}")
+
+        # Build the shutdown script for this session
+        if not no_context:
+            # Send context command
+            send_text_script = f'''
+            tell application "iTerm"
+                tell window {window_idx}
+                    tell tab {tab_idx}
+                        tell session {session_idx}
+                            write text "write context to docs/PROJECT-CONTEXT.md"
+                        end tell
+                    end tell
+                end tell
+            end tell
+            '''
+            try:
+                subprocess.run(["osascript", "-e", send_text_script], capture_output=True, check=True)
+                console.print(f"    [green]✓[/green] {session_id}: Sent context command")
+            except subprocess.CalledProcessError:
+                console.print(f"    [yellow]![/yellow] {session_id}: Could not send context command")
+
+            # Wait for context to be written
+            time.sleep(context_wait)
+
+        # Send /exit
+        exit_script = f'''
+        tell application "iTerm"
+            tell window {window_idx}
+                tell tab {tab_idx}
+                    tell session {session_idx}
+                        write text "/exit"
+                    end tell
+                end tell
+            end tell
+        end tell
+        '''
+        try:
+            subprocess.run(["osascript", "-e", exit_script], capture_output=True, check=True)
+            console.print(f"    [green]✓[/green] {session_id}: Sent /exit")
+        except subprocess.CalledProcessError:
+            console.print(f"    [yellow]![/yellow] {session_id}: Could not send /exit")
+
+        # Wait for exit
+        time.sleep(5)
+
+        # Close the tab
+        close_script = f'''
+        tell application "iTerm"
+            tell window {window_idx}
+                tell tab {tab_idx}
+                    close
+                end tell
+            end tell
+        end tell
+        '''
+        try:
+            subprocess.run(["osascript", "-e", close_script], capture_output=True, check=True)
+            console.print(f"    [green]✓[/green] {session_id}: Closed tab")
+        except subprocess.CalledProcessError:
+            console.print(f"    [yellow]![/yellow] {session_id}: Could not close tab (may already be closed)")
+
+    # Get window/tab/session structure
+    structure_script = '''
+    tell application "iTerm"
+        set result to ""
+        set wIdx to 1
+        repeat with w in windows
+            set tIdx to 1
+            repeat with t in tabs of w
+                set sIdx to 1
+                repeat with s in sessions of t
+                    set result to result & wIdx & "," & tIdx & "," & sIdx & "\\n"
+                    set sIdx to sIdx + 1
+                end repeat
+                set tIdx to tIdx + 1
+            end repeat
+            set wIdx to wIdx + 1
+        end repeat
+        return result
+    end tell
+    '''
+
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", structure_script],
+            capture_output=True, text=True, check=True
+        )
+        sessions_raw = result.stdout.strip().split('\n')
+        sessions = []
+        for line in sessions_raw:
+            if line.strip():
+                parts = line.strip().split(',')
+                if len(parts) == 3:
+                    sessions.append((int(parts[0]), int(parts[1]), int(parts[2])))
+    except (subprocess.CalledProcessError, ValueError) as e:
+        console.print(f"[red]Failed to enumerate sessions: {e}[/red]")
+        return
+
+    if not sessions:
+        console.print("[yellow]No sessions to shutdown[/yellow]")
+        return
+
+    console.print(f"\n[bold blue]Shutting down {len(sessions)} sessions...[/bold blue]")
+
+    # Launch threads with 2 second stagger
+    threads = []
+    for i, (w_idx, t_idx, s_idx) in enumerate(sessions):
+        delay = i * 2.0  # 2 second stagger
+        t = threading.Thread(target=shutdown_session, args=(w_idx, t_idx, s_idx, delay))
+        threads.append(t)
+        t.start()
+
+    # Wait for all threads to complete
+    for t in threads:
+        t.join()
+
+    console.print(f"\n[bold green]Shutdown complete![/bold green]")
 
 
 if __name__ == "__main__":

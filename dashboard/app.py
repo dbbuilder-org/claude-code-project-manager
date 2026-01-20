@@ -1,4 +1,4 @@
-"""Streamlit dashboard for project manager."""
+"""Streamlit dashboard for project manager - Optimized version."""
 
 import sys
 import subprocess
@@ -13,780 +13,331 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 from pm.database.models import init_db, get_session, Project
-from pm.scanner.parser import ProgressParser
-from pm.generator.prompts import ContinuePromptGenerator, PromptMode
+from pm.metadata import sync_to_file, PM_STATUS_FILENAME, ProjectMetadata
 
-# Page config
+# Page config - must be first
 st.set_page_config(
     page_title="Project Manager",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
-# Custom CSS
+# Minimal CSS
 st.markdown("""
 <style>
-    .project-card {
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin-bottom: 0.5rem;
-    }
-    .health-high { background-color: rgba(0, 255, 0, 0.1); }
-    .health-medium { background-color: rgba(255, 255, 0, 0.1); }
-    .health-low { background-color: rgba(255, 0, 0, 0.1); }
-    .stProgress > div > div > div > div {
-        background-color: #4CAF50;
-    }
-    .action-btn {
-        padding: 0.25rem 0.5rem;
-        font-size: 0.8rem;
-    }
-    div[data-testid="stExpander"] details summary p {
-        font-size: 1.1rem;
-        font-weight: 600;
-    }
+    .stExpander { border: 1px solid #ddd; border-radius: 4px; margin-bottom: 4px; }
+    .commit-msg { color: #666; font-size: 0.85em; }
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize database
+# Initialize
 init_db()
 
-# Session state for selections
-if "selected_projects" not in st.session_state:
-    st.session_state.selected_projects = set()
+# Session state
+if "selected" not in st.session_state:
+    st.session_state.selected = set()
+if "page" not in st.session_state:
+    st.session_state.page = 0
 
 
-def get_projects_data(include_archived: bool = False):
-    """Load projects with health scores."""
+@st.cache_data(ttl=120)
+def load_projects():
+    """Load all projects from database with caching."""
     session = get_session()
-    query = session.query(Project)
-    if not include_archived:
-        query = query.filter((Project.archived == False) | (Project.archived == None))
-    projects = query.all()
+    try:
+        projects = session.query(Project).filter(
+            (Project.archived == False) | (Project.archived == None)
+        ).all()
 
-    data = []
-    for p in projects:
-        # Calculate days since last activity
-        if p.last_activity:
-            days_inactive = (datetime.utcnow() - p.last_activity).days
-        else:
+        data = []
+        for p in projects:
             days_inactive = None
+            if p.last_activity:
+                days_inactive = (datetime.utcnow() - p.last_activity).days
 
-        data.append({
-            "name": p.name,
-            "path": p.path,
-            "category": p.category,
-            "type": p.project_type,
-            "completion": p.completion_pct or 0,
-            "health": p.health_score,
-            "urgency": p.urgency_score,
-            "phase": p.current_phase or "",
-            "status": p.current_status or "",
-            "next_action": p.next_action or "",
-            "has_decision": p.has_pending_decision,
-            "git_dirty": p.git_dirty,
-            "git_branch": p.git_branch or "",
-            "last_activity": p.last_activity,
-            "days_inactive": days_inactive,
-            "last_scanned": p.last_scanned,
-            "has_claude_md": p.has_claude_md,
-            "has_todo": p.has_todo,
-            # PM metadata
-            "priority": p.priority or 3,
-            "priority_label": p.priority_label,
-            "deadline": p.deadline,
-            "target_date": p.target_date,
-            "days_to_deadline": p.days_until_deadline,
-            "is_overdue": p.is_overdue,
-            "notes": p.notes or "",
-            "tags": p.tags_list,
-            "client_name": p.client_name or "",
-            "budget_hours": p.budget_hours,
-            "hours_logged": p.hours_logged or 0,
-            "archived": p.archived or False,
-        })
+            # Truncate commit message
+            commit_msg = p.last_commit_msg or ""
+            if len(commit_msg) > 60:
+                commit_msg = commit_msg[:57] + "..."
 
-    session.close()
-    return pd.DataFrame(data)
+            data.append({
+                "name": p.name,
+                "path": p.path,
+                "category": p.category or "internal",
+                "type": p.project_type or "unknown",
+                "completion": p.completion_pct or 0,
+                "health": p.health_score,
+                "urgency": p.urgency_score,
+                "next_action": p.next_action or "",
+                "has_decision": p.has_pending_decision or False,
+                "git_dirty": p.git_dirty or False,
+                "last_commit": p.last_commit_date,
+                "commit_msg": commit_msg,
+                "days_inactive": days_inactive,
+                "priority": p.priority or 3,
+                "priority_label": p.priority_label,
+                "deadline": p.deadline,
+                "is_overdue": p.is_overdue,
+                "days_to_deadline": p.days_until_deadline,
+                "notes": p.notes or "",
+                "client_name": p.client_name or "",
+            })
+        return pd.DataFrame(data)
+    finally:
+        session.close()
 
 
-def update_project_metadata(name: str, **kwargs):
-    """Update project metadata in database."""
-    import json
-    session = get_session()
-    project = session.query(Project).filter(Project.name == name).first()
-    if project:
-        for key, value in kwargs.items():
-            if key == "tags" and isinstance(value, list):
-                value = json.dumps(value)
-            if hasattr(project, key):
-                setattr(project, key, value)
-        session.commit()
-    session.close()
-
-
-def open_in_vscode(path: str):
-    """Open project in VSCode."""
-    subprocess.Popen(["code", path])
-
-
-def open_in_terminal(path: str):
-    """Open new terminal at project path."""
-    # macOS: Open in new iTerm2 tab or Terminal
+def launch_claude(path: str, name: str):
+    """Launch Claude Code in iTerm2."""
     script = f'''
     tell application "iTerm"
         activate
         tell current window
             create tab with default profile
             tell current session
-                write text "cd '{path}'"
+                write text "cd '{path}' && transcript && claude --dangerously-skip-permissions --continue"
             end tell
         end tell
     end tell
     '''
-    try:
-        subprocess.Popen(["osascript", "-e", script])
-    except:
-        # Fallback to Terminal.app
-        subprocess.Popen(["open", "-a", "Terminal", path])
+    subprocess.Popen(["osascript", "-e", script])
 
 
-def open_in_finder(path: str):
-    """Open project folder in Finder."""
-    subprocess.Popen(["open", path])
+def launch_batch(paths_names: list):
+    """Launch multiple projects."""
+    import time
+    for path, name in paths_names:
+        launch_claude(path, name)
+        time.sleep(0.5)
 
 
-def launch_claude_code(path: str, name: str, prompt: str = None):
-    """Launch Claude Code for a project."""
-    cmd = ["claude"]
-    if prompt:
-        cmd.extend(["-p", prompt])
+def generate_report(report_type: str, df: pd.DataFrame):
+    """Generate a report using headless Claude."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = f"~/dev2/project-manager/reports/{report_type}_{timestamp}.md"
 
-    # Open in new iTerm tab
-    prompt_arg = f' -p "{prompt}"' if prompt else ""
+    # Create reports directory
+    os.makedirs(os.path.expanduser("~/dev2/project-manager/reports"), exist_ok=True)
+
+    # Build project summary for the prompt
+    if report_type == "weekly":
+        recent = df.nlargest(20, "last_commit") if "last_commit" in df.columns else df.head(20)
+        prompt = f"""Generate a weekly project status summary report in markdown format.
+
+Projects with recent activity:
+{recent[['name', 'category', 'completion', 'health', 'commit_msg']].to_string()}
+
+Include:
+1. Executive summary (2-3 sentences)
+2. Projects with significant progress this week
+3. Projects needing attention (low health or overdue)
+4. Recommended priorities for next week
+
+Save to: {output_file}
+"""
+    else:  # status
+        prompt = f"""Generate a comprehensive project status report in markdown format.
+
+All {len(df)} projects summary:
+- By category: {df['category'].value_counts().to_dict()}
+- Average health: {df['health'].mean():.0f}
+- Average completion: {df['completion'].mean():.0f}%
+- Projects with decisions needed: {df['has_decision'].sum()}
+- Overdue projects: {df['is_overdue'].sum()}
+
+Top 10 by urgency:
+{df.nlargest(10, 'urgency')[['name', 'priority_label', 'health', 'completion']].to_string()}
+
+Save to: {output_file}
+"""
+
+    # Launch headless Claude
+    cmd = f'claude -p "{prompt}" --output-format text > {output_file}'
     script = f'''
     tell application "iTerm"
         activate
         tell current window
             create tab with default profile
             tell current session
-                write text "cd '{path}' && claude{prompt_arg}"
+                write text "cd ~/dev2/project-manager && {cmd}"
             end tell
         end tell
     end tell
     '''
-    try:
-        subprocess.Popen(["osascript", "-e", script])
-        return True
-    except Exception as e:
-        st.error(f"Failed to launch: {e}")
-        return False
-
-
-def get_project_files(path: str) -> dict:
-    """Read project progress files."""
-    p = Path(path)
-    files = {}
-
-    for filename in ["TODO.md", "PROGRESS.md", "CLAUDE.md", "README.md"]:
-        filepath = p / filename
-        if filepath.exists():
-            try:
-                files[filename] = filepath.read_text()[:5000]  # Limit size
-            except:
-                files[filename] = "(Could not read file)"
-
-    return files
-
-
-def get_project_context(project_path: str, project_name: str) -> str:
-    """Generate context for a project."""
-    parser = ProgressParser()
-    generator = ContinuePromptGenerator()
-    path = Path(project_path)
-    progress = parser.parse_project(path)
-    prompt = generator.generate(path, project_name, progress, PromptMode.CONTEXT)
-    return prompt.prompt_text or ""
+    subprocess.Popen(["osascript", "-e", script])
+    return output_file
 
 
 def main():
     st.title("📊 Project Manager")
 
     # Load data
-    df = get_projects_data()
+    with st.spinner("Loading projects..."):
+        df = load_projects()
 
     if df.empty:
-        st.warning("No projects found. Run `pm scan ~/dev2` first.")
-        st.code("pm scan ~/dev2")
+        st.error("No projects found. Run `pm scan ~/dev2` first.")
         return
 
-    # Sidebar
-    with st.sidebar:
-        st.header("🔍 Filters")
+    # Stats bar
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("Total", len(df))
+    col2.metric("Avg Health", f"{df['health'].mean():.0f}")
+    col3.metric("Dirty", len(df[df['git_dirty'] == True]))
+    col4.metric("Decisions", len(df[df['has_decision'] == True]))
+    col5.metric("Overdue", len(df[df['is_overdue'] == True]))
 
-        # Category filter
-        categories = ["All"] + sorted(df["category"].unique().tolist())
-        selected_category = st.selectbox("Category", categories)
-        if selected_category != "All":
-            df = df[df["category"] == selected_category]
+    st.divider()
 
-        # Health filter
-        health_filter = st.selectbox(
-            "Health",
-            ["All", "Healthy (70+)", "Needs Work (40-69)", "Critical (<40)"]
-        )
-        if health_filter == "Healthy (70+)":
-            df = df[df["health"] >= 70]
-        elif health_filter == "Needs Work (40-69)":
-            df = df[(df["health"] >= 40) & (df["health"] < 70)]
-        elif health_filter == "Critical (<40)":
-            df = df[df["health"] < 40]
+    # Controls row
+    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([2, 1, 1, 2])
 
-        # Quick filters
-        st.markdown("**Quick Filters**")
-        if st.checkbox("Has pending decisions"):
-            df = df[df["has_decision"] == True]
-        if st.checkbox("Has uncommitted changes"):
-            df = df[df["git_dirty"] == True]
-        if st.checkbox("Stale (30+ days inactive)"):
-            df = df[df["days_inactive"].notna() & (df["days_inactive"] > 30)]
-        if st.checkbox("In progress (25-90%)"):
-            df = df[(df["completion"] >= 25) & (df["completion"] < 90)]
-
-        # Search
-        search = st.text_input("🔎 Search", placeholder="Project name...")
-        if search:
-            df = df[df["name"].str.contains(search, case=False, na=False)]
-
-        st.divider()
-
-        # Quick stats
-        st.header("📈 Stats")
-        total = len(df)
-        avg_health = df["health"].mean() if total > 0 else 0
-        avg_completion = df["completion"].mean() if total > 0 else 0
-
-        col1, col2 = st.columns(2)
-        col1.metric("Projects", total)
-        col2.metric("Avg Health", f"{avg_health:.0f}")
-
-        # Alerts
-        decisions = df[df["has_decision"] == True]
-        if len(decisions) > 0:
-            st.warning(f"⚠️ {len(decisions)} pending decisions")
-
-        dirty = df[df["git_dirty"] == True]
-        if len(dirty) > 0:
-            st.info(f"● {len(dirty)} uncommitted changes")
-
-        st.divider()
-
-        # Batch actions
-        st.header("🚀 Batch Actions")
-        selected = st.session_state.selected_projects
-        st.caption(f"{len(selected)} projects selected")
-
-        if len(selected) > 0:
-            if st.button("Launch Selected in Claude", type="primary"):
-                for name in selected:
-                    row = df[df["name"] == name].iloc[0] if len(df[df["name"] == name]) > 0 else None
-                    if row is not None:
-                        launch_claude_code(row["path"], row["name"])
-                st.success(f"Launched {len(selected)} projects!")
-                st.session_state.selected_projects = set()
-                st.rerun()
-
-            if st.button("Clear Selection"):
-                st.session_state.selected_projects = set()
-                st.rerun()
-
-    # Main content tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "📋 All Projects",
-        "🔥 Urgent",
-        "🎯 Work Queue",
-        "⚠️ Decisions",
-        "🟢 Clients",
-        "✏️ Edit",
-        "📊 Analytics"
-    ])
-
-    with tab1:
-        render_project_list(df)
-
-    with tab2:
-        render_urgent(df)
-
-    with tab3:
-        render_work_queue(df)
-
-    with tab4:
-        render_decisions(df)
-
-    with tab5:
-        client_df = df[df["category"] == "client"]
-        if len(client_df) > 0:
-            render_project_list(client_df, show_category=False)
-        else:
-            st.info("No client projects found")
-
-    with tab6:
-        render_edit_metadata(df)
-
-    with tab7:
-        render_analytics(df)
-
-
-def render_work_queue(df: pd.DataFrame):
-    """Render prioritized work queue."""
-    st.subheader("🎯 Suggested Next Actions")
-    st.caption("Projects sorted by priority based on health, decisions, and activity")
-
-    # Score projects for work priority
-    work_df = df.copy()
-
-    # Priority score: lower health + decisions + recent activity = higher priority
-    work_df["priority"] = (
-        (100 - work_df["health"]) * 0.4 +  # Lower health = higher priority
-        work_df["has_decision"].astype(int) * 30 +  # Decisions need resolution
-        work_df["git_dirty"].astype(int) * 10 +  # Uncommitted work
-        ((work_df["completion"] > 25) & (work_df["completion"] < 90)).astype(int) * 20  # In progress
-    )
-
-    # Sort by priority descending
-    work_df = work_df.sort_values("priority", ascending=False).head(20)
-
-    for idx, row in work_df.iterrows():
-        with st.expander(f"{'⚠️ ' if row['has_decision'] else ''}{row['name']} — Health: {row['health']:.0f}, Progress: {row['completion']:.0f}%"):
-            col1, col2 = st.columns([3, 1])
-
-            with col1:
-                # Why it's prioritized
-                reasons = []
-                if row["has_decision"]:
-                    reasons.append("🔴 Has pending decision")
-                if row["health"] < 40:
-                    reasons.append("🔴 Critical health score")
-                elif row["health"] < 70:
-                    reasons.append("🟡 Needs attention")
-                if row["git_dirty"]:
-                    reasons.append("● Has uncommitted changes")
-                if row["completion"] >= 25 and row["completion"] < 90:
-                    reasons.append("🔄 In progress")
-
-                if reasons:
-                    st.markdown("**Priority reasons:**")
-                    for r in reasons:
-                        st.markdown(f"- {r}")
-
-                if row["next_action"]:
-                    st.markdown(f"**Next action:** {row['next_action']}")
-
-                if row["phase"]:
-                    st.markdown(f"**Current phase:** {row['phase']}")
-
-            with col2:
-                st.markdown("**Quick Actions**")
-                if st.button("🚀 Claude", key=f"wq_claude_{idx}"):
-                    context = get_project_context(row["path"], row["name"])
-                    launch_claude_code(row["path"], row["name"], context[:500])
-                    st.success("Launched!")
-
-                if st.button("📂 VSCode", key=f"wq_vscode_{idx}"):
-                    open_in_vscode(row["path"])
-
-                if st.button("💻 Terminal", key=f"wq_term_{idx}"):
-                    open_in_terminal(row["path"])
-
-
-def render_urgent(df: pd.DataFrame):
-    """Render urgent projects by deadline and priority."""
-    st.subheader("🔥 Urgent Projects")
-    st.caption("Sorted by urgency score (deadlines + priority)")
-
-    # Sort by urgency
-    urgent_df = df.sort_values("urgency", ascending=False)
-
-    # Show overdue first
-    overdue = urgent_df[urgent_df["is_overdue"] == True]
-    if len(overdue) > 0:
-        st.error(f"🚨 {len(overdue)} OVERDUE projects!")
-        for idx, row in overdue.iterrows():
-            days = abs(row["days_to_deadline"])
-            with st.expander(f"🔴 {row['name']} — OVERDUE by {days} days"):
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    st.markdown(f"**Deadline:** {row['deadline'].strftime('%Y-%m-%d')}")
-                    st.markdown(f"**Priority:** {row['priority_label']}")
-                    if row["notes"]:
-                        st.markdown(f"**Notes:** {row['notes']}")
-                with col2:
-                    if st.button("🚀 Claude", key=f"urg_claude_{idx}"):
-                        launch_claude_code(row["path"], row["name"])
-
-    # Show upcoming deadlines
-    upcoming = urgent_df[
-        (urgent_df["days_to_deadline"].notna()) &
-        (urgent_df["days_to_deadline"] >= 0) &
-        (urgent_df["days_to_deadline"] <= 14)
-    ]
-    if len(upcoming) > 0:
-        st.warning(f"⏰ {len(upcoming)} projects due within 2 weeks")
-        for idx, row in upcoming.iterrows():
-            days = row["days_to_deadline"]
-            urgency_color = "🔴" if days <= 3 else "🟡" if days <= 7 else "🟢"
-            with st.expander(f"{urgency_color} {row['name']} — {days} days left"):
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    st.markdown(f"**Deadline:** {row['deadline'].strftime('%Y-%m-%d')}")
-                    st.markdown(f"**Priority:** {row['priority_label']}")
-                    st.markdown(f"**Progress:** {row['completion']:.0f}%")
-                    if row["notes"]:
-                        st.markdown(f"**Notes:** {row['notes']}")
-                with col2:
-                    if st.button("🚀 Claude", key=f"upc_claude_{idx}"):
-                        launch_claude_code(row["path"], row["name"])
-
-    # Show high priority without deadlines
-    high_priority = urgent_df[
-        (urgent_df["priority"] <= 2) &
-        (urgent_df["deadline"].isna())
-    ]
-    if len(high_priority) > 0:
-        st.info(f"⭐ {len(high_priority)} high priority projects (no deadline set)")
-        for idx, row in high_priority.head(10).iterrows():
-            priority_icon = "🔴" if row["priority"] == 1 else "🟡"
-            with st.expander(f"{priority_icon} {row['name']} — {row['priority_label']}"):
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    st.markdown(f"**Category:** {row['category']}")
-                    st.markdown(f"**Progress:** {row['completion']:.0f}%")
-                    if row["notes"]:
-                        st.markdown(f"**Notes:** {row['notes']}")
-                with col2:
-                    if st.button("🚀 Claude", key=f"hp_claude_{idx}"):
-                        launch_claude_code(row["path"], row["name"])
-
-
-def render_edit_metadata(df: pd.DataFrame):
-    """Render metadata editing interface."""
-    st.subheader("✏️ Edit Project Metadata")
-
-    # Project selector
-    project_names = sorted(df["name"].tolist())
-    selected_project = st.selectbox("Select Project", [""] + project_names)
-
-    if not selected_project:
-        st.info("Select a project to edit its metadata")
-        return
-
-    row = df[df["name"] == selected_project].iloc[0]
-
-    st.markdown(f"**Path:** `{row['path']}`")
-    st.markdown(f"**Category:** {row['category']} | **Type:** {row['type']}")
-
-    st.markdown("---")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        # Priority
-        priority_options = {
-            "1 - Critical": 1,
-            "2 - High": 2,
-            "3 - Normal": 3,
-            "4 - Low": 4,
-            "5 - Someday": 5
+    with ctrl1:
+        sort_options = {
+            "Last Commit ↓": ("last_commit", False),
+            "Last Commit ↑": ("last_commit", True),
+            "Health ↓": ("health", False),
+            "Health ↑": ("health", True),
+            "Name A-Z": ("name", True),
+            "Priority ↓": ("priority", True),
+            "Urgency ↓": ("urgency", False),
         }
-        current_priority = [k for k, v in priority_options.items() if v == row["priority"]][0]
-        new_priority = st.selectbox("Priority", list(priority_options.keys()),
-                                     index=list(priority_options.keys()).index(current_priority))
+        sort_choice = st.selectbox("Sort", list(sort_options.keys()), label_visibility="collapsed")
+        sort_col, sort_asc = sort_options[sort_choice]
 
-        # Deadline
-        current_deadline = row["deadline"].date() if pd.notna(row["deadline"]) else None
-        new_deadline = st.date_input("Deadline", value=current_deadline)
+    with ctrl2:
+        filter_cat = st.selectbox("Category", ["All"] + sorted(df["category"].unique().tolist()), label_visibility="collapsed")
 
-        # Target date
-        current_target = row["target_date"].date() if pd.notna(row["target_date"]) else None
-        new_target = st.date_input("Target Date", value=current_target)
+    with ctrl3:
+        filter_type = st.selectbox("Filter", ["All", "Dirty", "Decisions", "Overdue"], label_visibility="collapsed")
 
-    with col2:
-        # Client name
-        new_client = st.text_input("Client Name", value=row["client_name"])
+    with ctrl4:
+        bcol1, bcol2, bcol3 = st.columns(3)
+        with bcol1:
+            if st.button("🚀 Top 10", use_container_width=True):
+                sorted_df = df.sort_values(sort_col, ascending=sort_asc, na_position="last").head(10)
+                launch_batch([(r["path"], r["name"]) for _, r in sorted_df.iterrows()])
+                st.success("Launched 10!")
+        with bcol2:
+            if st.button("📊 Weekly", use_container_width=True):
+                f = generate_report("weekly", df)
+                st.info(f"Generating: {f}")
+        with bcol3:
+            if st.button("📋 Status", use_container_width=True):
+                f = generate_report("status", df)
+                st.info(f"Generating: {f}")
 
-        # Budget hours
-        new_budget = st.number_input("Budget Hours", value=row["budget_hours"] or 0.0, min_value=0.0)
+    # Apply filters
+    filtered_df = df.copy()
+    if filter_cat != "All":
+        filtered_df = filtered_df[filtered_df["category"] == filter_cat]
+    if filter_type == "Dirty":
+        filtered_df = filtered_df[filtered_df["git_dirty"] == True]
+    elif filter_type == "Decisions":
+        filtered_df = filtered_df[filtered_df["has_decision"] == True]
+    elif filter_type == "Overdue":
+        filtered_df = filtered_df[filtered_df["is_overdue"] == True]
 
-        # Hours logged
-        new_hours = st.number_input("Hours Logged", value=row["hours_logged"] or 0.0, min_value=0.0)
+    # Sort
+    filtered_df = filtered_df.sort_values(sort_col, ascending=sort_asc, na_position="last")
 
-    # Tags
-    current_tags = ", ".join(row["tags"]) if row["tags"] else ""
-    new_tags = st.text_input("Tags (comma-separated)", value=current_tags)
+    st.caption(f"Showing {len(filtered_df)} of {len(df)} projects")
 
-    # Notes
-    new_notes = st.text_area("Notes / Commentary", value=row["notes"], height=150)
+    # Pagination
+    PAGE_SIZE = 25
+    total_pages = max(1, (len(filtered_df) - 1) // PAGE_SIZE + 1)
 
-    # Archive toggle
-    new_archived = st.checkbox("Archived", value=row["archived"])
+    if total_pages > 1:
+        pcol1, pcol2, pcol3 = st.columns([1, 2, 1])
+        with pcol1:
+            if st.button("← Prev") and st.session_state.page > 0:
+                st.session_state.page -= 1
+                st.rerun()
+        with pcol2:
+            st.markdown(f"<center>Page {st.session_state.page + 1} of {total_pages}</center>", unsafe_allow_html=True)
+        with pcol3:
+            if st.button("Next →") and st.session_state.page < total_pages - 1:
+                st.session_state.page += 1
+                st.rerun()
 
-    # Save button
-    if st.button("💾 Save Changes", type="primary"):
-        updates = {}
+    # Get current page
+    start_idx = st.session_state.page * PAGE_SIZE
+    page_df = filtered_df.iloc[start_idx:start_idx + PAGE_SIZE]
 
-        if priority_options[new_priority] != row["priority"]:
-            updates["priority"] = priority_options[new_priority]
+    # Column headers
+    hdr1, hdr2, hdr3, hdr4, hdr5, hdr6, hdr7 = st.columns([0.5, 2.5, 0.8, 0.8, 1, 1, 1.2])
+    hdr1.markdown("**St**")
+    hdr2.markdown("**Project**")
+    hdr3.markdown("**Health**")
+    hdr4.markdown("**Done**")
+    hdr5.markdown("**Last Activity**")
+    hdr6.markdown("**Last Commit**")
+    hdr7.markdown("**Actions**")
+    st.divider()
 
-        if new_deadline != current_deadline:
-            updates["deadline"] = datetime.combine(new_deadline, datetime.min.time()) if new_deadline else None
+    # Render projects as rows
+    for idx, row in page_df.iterrows():
+        col1, col2, col3, col4, col5, col6, col7 = st.columns([0.5, 2.5, 0.8, 0.8, 1, 1, 1.2])
 
-        if new_target != current_target:
-            updates["target_date"] = datetime.combine(new_target, datetime.min.time()) if new_target else None
-
-        if new_client != row["client_name"]:
-            updates["client_name"] = new_client
-
-        if new_budget != (row["budget_hours"] or 0.0):
-            updates["budget_hours"] = new_budget
-
-        if new_hours != (row["hours_logged"] or 0.0):
-            updates["hours_logged"] = new_hours
-
-        new_tags_list = [t.strip() for t in new_tags.split(",") if t.strip()]
-        if new_tags_list != row["tags"]:
-            updates["tags"] = new_tags_list
-
-        if new_notes != row["notes"]:
-            updates["notes"] = new_notes
-
-        if new_archived != row["archived"]:
-            updates["archived"] = new_archived
-
-        if updates:
-            update_project_metadata(selected_project, **updates)
-            st.success(f"✓ Updated: {', '.join(updates.keys())}")
-            st.rerun()
-        else:
-            st.info("No changes to save")
-
-
-def render_decisions(df: pd.DataFrame):
-    """Render pending decisions."""
-    decisions_df = df[df["has_decision"] == True]
-
-    if len(decisions_df) == 0:
-        st.success("✅ No pending decisions!")
-        return
-
-    st.subheader(f"⚠️ {len(decisions_df)} Projects Need Decisions")
-
-    for idx, row in decisions_df.iterrows():
-        with st.expander(f"{row['name']} — {row['category']}"):
-            col1, col2 = st.columns([3, 1])
-
-            with col1:
-                # Try to show decision from files
-                files = get_project_files(row["path"])
-
-                # Look for decision content in TODO or PROGRESS
-                decision_content = None
-                for fname, content in files.items():
-                    if "decision" in content.lower() or "option a" in content.lower():
-                        # Extract decision section
-                        lines = content.split("\n")
-                        in_decision = False
-                        decision_lines = []
-                        for line in lines:
-                            if "decision" in line.lower() or "option" in line.lower():
-                                in_decision = True
-                            if in_decision:
-                                decision_lines.append(line)
-                                if len(decision_lines) > 20:
-                                    break
-                        if decision_lines:
-                            decision_content = "\n".join(decision_lines)
-                            break
-
-                if decision_content:
-                    st.markdown("**Decision needed:**")
-                    st.code(decision_content, language="markdown")
-                else:
-                    st.markdown("*Decision details in project files*")
-
-                st.markdown(f"**Path:** `{row['path']}`")
-
-            with col2:
-                if st.button("🚀 Open & Decide", key=f"dec_claude_{idx}"):
-                    prompt = f"Review the pending decision in this project and help me make a choice. Look at TODO.md or PROGRESS.md for the decision context."
-                    launch_claude_code(row["path"], row["name"], prompt)
-
-                if st.button("📂 Open Files", key=f"dec_vscode_{idx}"):
-                    open_in_vscode(row["path"])
-
-
-def render_project_list(df: pd.DataFrame, show_category: bool = True):
-    """Render the project list with expandable details."""
-
-    # Sort options
-    col1, col2, col3 = st.columns([2, 2, 1])
-    with col1:
-        sort_by = st.selectbox(
-            "Sort by",
-            ["name", "health", "completion", "last_activity"],
-            key=f"sort_{id(df)}"
-        )
-    with col2:
-        ascending = not st.checkbox("Descending", key=f"desc_{id(df)}")
-    with col3:
-        select_all = st.checkbox("Select all", key=f"sel_all_{id(df)}")
-        if select_all:
-            st.session_state.selected_projects = set(df["name"].tolist())
-
-    df = df.sort_values(sort_by, ascending=ascending, na_position="last")
-
-    st.caption(f"Showing {len(df)} projects")
-
-    # Render expandable cards
-    for idx, row in df.iterrows():
-        # Health indicator
-        health = row["health"]
-        if health >= 70:
-            health_icon = "🟢"
-        elif health >= 40:
-            health_icon = "🟡"
-        else:
-            health_icon = "🔴"
-
-        # Build title
+        # Status icons
+        health_icon = "🟢" if row["health"] >= 70 else "🟡" if row["health"] >= 40 else "🔴"
+        pri_icon = {1: "🔴", 2: "🟠", 3: "⚪", 4: "🔵", 5: "⚪"}.get(row["priority"], "⚪")
         badges = []
-        if show_category:
-            cat_emoji = {"client": "👤", "internal": "🏠", "tool": "🔧"}.get(row["category"], "")
-            badges.append(cat_emoji)
-        if row["has_decision"]:
-            badges.append("⚠️")
         if row["git_dirty"]:
             badges.append("●")
+        if row["has_decision"]:
+            badges.append("⚠️")
+        if row["is_overdue"]:
+            badges.append("⏰")
 
-        badge_str = " ".join(badges)
-        title = f"{badge_str} {row['name']} — {health_icon} {health:.0f} | {row['completion']:.0f}%"
+        col1.markdown(f"{pri_icon} {' '.join(badges)}")
 
-        with st.expander(title):
-            # Selection checkbox
-            selected = st.checkbox(
-                "Select for batch",
-                value=row["name"] in st.session_state.selected_projects,
-                key=f"sel_{idx}"
-            )
-            if selected:
-                st.session_state.selected_projects.add(row["name"])
-            else:
-                st.session_state.selected_projects.discard(row["name"])
-
-            # Main content
-            col1, col2 = st.columns([3, 1])
-
-            with col1:
-                # Project info
-                st.markdown(f"**Path:** `{row['path']}`")
-
-                if row["phase"]:
-                    st.markdown(f"**Phase:** {row['phase']}")
+        # Project name with expander for details
+        with col2:
+            with st.expander(f"**{row['name']}**", expanded=False):
+                if row["commit_msg"]:
+                    st.caption(f"💬 {row['commit_msg']}")
+                st.text(f"📁 {row['path']}")
                 if row["next_action"]:
                     st.markdown(f"**Next:** {row['next_action']}")
-                if row["git_branch"]:
-                    st.markdown(f"**Branch:** `{row['git_branch']}`")
+                if row["notes"]:
+                    st.info(row["notes"])
 
-                # Activity
-                if row["days_inactive"] is not None:
-                    days = row["days_inactive"]
-                    if days == 0:
-                        st.markdown("**Activity:** Today")
-                    elif days < 7:
-                        st.markdown(f"**Activity:** {days} days ago")
-                    elif days < 30:
-                        st.markdown(f"**Activity:** {days // 7} weeks ago")
-                    else:
-                        st.markdown(f"**Activity:** ⚠️ {days // 30} months ago")
+        # Health
+        col3.markdown(f"{health_icon} {row['health']:.0f}")
 
-                # Progress files
-                st.markdown("---")
-                files = get_project_files(row["path"])
-                if files:
-                    file_tabs = st.tabs(list(files.keys()))
-                    for tab, (fname, content) in zip(file_tabs, files.items()):
-                        with tab:
-                            st.code(content, language="markdown")
+        # Completion
+        col4.markdown(f"{row['completion']:.0f}%")
 
-            with col2:
-                st.markdown("**Actions**")
+        # Last Activity
+        if row["days_inactive"] is not None:
+            if row["days_inactive"] == 0:
+                col5.markdown("Today")
+            elif row["days_inactive"] < 7:
+                col5.markdown(f"{row['days_inactive']}d ago")
+            elif row["days_inactive"] < 30:
+                col5.markdown(f"{row['days_inactive']//7}w ago")
+            else:
+                col5.markdown(f"{row['days_inactive']//30}mo ago")
+        else:
+            col5.markdown("—")
 
-                if st.button("🚀 Claude Code", key=f"launch_{idx}", use_container_width=True):
-                    context = get_project_context(row["path"], row["name"])
-                    if launch_claude_code(row["path"], row["name"], context[:500]):
-                        st.success("Launched!")
+        # Last Commit
+        if pd.notna(row["last_commit"]):
+            col6.markdown(row["last_commit"].strftime("%m/%d %H:%M"))
+        else:
+            col6.markdown("—")
 
-                if st.button("📂 VSCode", key=f"vscode_{idx}", use_container_width=True):
-                    open_in_vscode(row["path"])
-                    st.success("Opened!")
-
-                if st.button("💻 Terminal", key=f"term_{idx}", use_container_width=True):
-                    open_in_terminal(row["path"])
-                    st.success("Opened!")
-
-                if st.button("📁 Finder", key=f"finder_{idx}", use_container_width=True):
-                    open_in_finder(row["path"])
-                    st.success("Opened!")
-
-                st.markdown("---")
-
-                # Copy context
-                if st.button("📋 Copy Context", key=f"ctx_{idx}", use_container_width=True):
-                    context = get_project_context(row["path"], row["name"])
-                    st.code(context, language=None)
-
-
-def render_analytics(df: pd.DataFrame):
-    """Render analytics charts."""
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("Projects by Category")
-        category_counts = df["category"].value_counts()
-        st.bar_chart(category_counts)
-
-    with col2:
-        st.subheader("Health Distribution")
-        health_bins = pd.cut(df["health"], bins=[0, 40, 70, 100], labels=["Critical", "Needs Work", "Healthy"])
-        health_counts = health_bins.value_counts()
-        st.bar_chart(health_counts)
-
-    col3, col4 = st.columns(2)
-
-    with col3:
-        st.subheader("Completion Distribution")
-        comp_bins = pd.cut(df["completion"], bins=[0, 25, 50, 75, 100], labels=["Early", "Quarter", "Half", "Near Done"])
-        comp_counts = comp_bins.value_counts()
-        st.bar_chart(comp_counts)
-
-    with col4:
-        st.subheader("Project Types")
-        type_counts = df["type"].value_counts()
-        st.bar_chart(type_counts)
-
-    # Tables
-    st.subheader("🏆 Top 10 Healthiest")
-    top_10 = df.nlargest(10, "health")[["name", "category", "health", "completion"]]
-    st.dataframe(top_10, use_container_width=True, hide_index=True)
-
-    st.subheader("⚠️ Bottom 10 (Need Attention)")
-    bottom_10 = df.nsmallest(10, "health")[["name", "category", "health", "completion", "days_inactive"]]
-    st.dataframe(bottom_10, use_container_width=True, hide_index=True)
-
-    st.subheader("🔥 Most Active (Recent Commits)")
-    active = df[df["days_inactive"].notna()].nsmallest(10, "days_inactive")[["name", "category", "days_inactive", "completion"]]
-    st.dataframe(active, use_container_width=True, hide_index=True)
+        # Actions
+        with col7:
+            ac1, ac2, ac3 = st.columns(3)
+            if ac1.button("🚀", key=f"l_{idx}", help="Launch Claude"):
+                launch_claude(row["path"], row["name"])
+            if ac2.button("📂", key=f"v_{idx}", help="VSCode"):
+                subprocess.Popen(["code", row["path"]])
+            if ac3.button("📁", key=f"f_{idx}", help="Finder"):
+                subprocess.Popen(["open", row["path"]])
 
 
 if __name__ == "__main__":

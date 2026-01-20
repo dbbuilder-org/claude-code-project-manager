@@ -335,7 +335,7 @@ class TestComponentIntegration:
 
     def test_detector_to_parser_integration(self, dev_directory):
         """Test detector output feeds into parser correctly."""
-        detector = ProjectDetector(dev_directory)
+        detector = ProjectDetector(dev_directory, skip_temp_dirs=False)
         parser = ProgressParser()
 
         projects = detector.scan()
@@ -353,7 +353,7 @@ class TestComponentIntegration:
 
     def test_parser_to_generator_integration(self, dev_directory):
         """Test parser output feeds into prompt generator correctly."""
-        detector = ProjectDetector(dev_directory)
+        detector = ProjectDetector(dev_directory, skip_temp_dirs=False)
         parser = ProgressParser()
         generator = ContinuePromptGenerator()
 
@@ -375,7 +375,7 @@ class TestComponentIntegration:
 
     def test_full_pipeline_integration(self, dev_directory):
         """Test the complete detection → parsing → generation pipeline."""
-        detector = ProjectDetector(dev_directory)
+        detector = ProjectDetector(dev_directory, skip_temp_dirs=False)
         parser = ProgressParser()
         generator = ContinuePromptGenerator()
 

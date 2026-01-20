@@ -62,11 +62,30 @@ class ProjectDetector:
     # Container folders that hold multiple projects (scan recursively)
     CONTAINER_FOLDERS = {'clients'}
 
-    def __init__(self, base_path: str | Path):
+    # System paths to skip (temp directories, etc.)
+    SKIP_PATHS = {
+        '/private/var/folders',  # macOS temp
+        '/var/folders',          # macOS temp (symlink)
+        '/tmp',
+        '/var/tmp',
+    }
+
+    def __init__(self, base_path: str | Path, skip_temp_dirs: bool = True):
         self.base_path = Path(base_path).resolve()
+
+        # Skip if base path is under a system temp directory
+        # Can be disabled via constructor param or PM_SKIP_TEMP_CHECK=0 env var (for tests)
+        self._skip_scan = False
+        if skip_temp_dirs and os.environ.get('PM_SKIP_TEMP_CHECK', '1') != '0':
+            base_str = str(self.base_path)
+            self._skip_scan = any(base_str.startswith(skip) for skip in self.SKIP_PATHS)
 
     def scan(self, max_depth: int = 2) -> list[ProjectInfo]:
         """Scan for projects up to max_depth levels deep."""
+        # Skip scanning system temp directories
+        if self._skip_scan:
+            return []
+
         projects = []
 
         for item in self.base_path.iterdir():
@@ -218,7 +237,7 @@ class ProjectDetector:
             pass  # Git info is optional
 
 
-def scan_projects(base_path: str | Path, max_depth: int = 2) -> list[ProjectInfo]:
+def scan_projects(base_path: str | Path, max_depth: int = 2, skip_temp_dirs: bool = True) -> list[ProjectInfo]:
     """Convenience function to scan for projects."""
-    detector = ProjectDetector(base_path)
+    detector = ProjectDetector(base_path, skip_temp_dirs=skip_temp_dirs)
     return detector.scan(max_depth=max_depth)

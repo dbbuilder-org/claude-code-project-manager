@@ -252,6 +252,17 @@ def project_info() -> ProjectInfo:
 
 
 @pytest.fixture(autouse=True)
+def skip_temp_check():
+    """Disable temp directory skipping for all tests.
+
+    Tests run in temp directories which would otherwise be skipped.
+    """
+    os.environ['PM_SKIP_TEMP_CHECK'] = '0'
+    yield
+    os.environ.pop('PM_SKIP_TEMP_CHECK', None)
+
+
+@pytest.fixture(autouse=True)
 def isolated_database(temp_dir):
     """Automatically isolate database for all tests.
 

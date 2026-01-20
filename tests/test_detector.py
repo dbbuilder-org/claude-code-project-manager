@@ -11,12 +11,12 @@ class TestProjectDetector:
 
     def test_init(self, temp_dir: Path):
         """Test detector initialization."""
-        detector = ProjectDetector(temp_dir)
+        detector = ProjectDetector(temp_dir, skip_temp_dirs=False)
         assert detector.base_path == temp_dir.resolve()
 
     def test_detect_node_project(self, sample_project_dir: Path):
         """Test detection of Node.js project by package.json."""
-        detector = ProjectDetector(sample_project_dir.parent)
+        detector = ProjectDetector(sample_project_dir.parent, skip_temp_dirs=False)
         projects = detector.scan()
 
         assert len(projects) == 1
@@ -25,7 +25,7 @@ class TestProjectDetector:
 
     def test_detect_python_project(self, sample_python_project: Path):
         """Test detection of Python project by pyproject.toml."""
-        detector = ProjectDetector(sample_python_project.parent)
+        detector = ProjectDetector(sample_python_project.parent, skip_temp_dirs=False)
         projects = detector.scan()
 
         assert len(projects) == 1
@@ -34,7 +34,7 @@ class TestProjectDetector:
 
     def test_detect_rust_project(self, sample_rust_project: Path):
         """Test detection of Rust project by Cargo.toml."""
-        detector = ProjectDetector(sample_rust_project.parent)
+        detector = ProjectDetector(sample_rust_project.parent, skip_temp_dirs=False)
         projects = detector.scan()
 
         assert len(projects) == 1
@@ -43,7 +43,7 @@ class TestProjectDetector:
 
     def test_detect_container_folder(self, clients_container: Path):
         """Test detection of projects in container folders like clients/."""
-        detector = ProjectDetector(clients_container.parent)
+        detector = ProjectDetector(clients_container.parent, skip_temp_dirs=False)
         projects = detector.scan()
 
         # Should find client-alpha and client-beta, not client-gamma (no markers)
@@ -59,7 +59,7 @@ class TestProjectDetector:
 
     def test_has_claude_md_detection(self, sample_project_dir: Path):
         """Test CLAUDE.md file detection."""
-        detector = ProjectDetector(sample_project_dir.parent)
+        detector = ProjectDetector(sample_project_dir.parent, skip_temp_dirs=False)
         projects = detector.scan()
 
         assert len(projects) == 1
@@ -67,7 +67,7 @@ class TestProjectDetector:
 
     def test_has_todo_detection(self, sample_project_dir: Path):
         """Test TODO.md file detection."""
-        detector = ProjectDetector(sample_project_dir.parent)
+        detector = ProjectDetector(sample_project_dir.parent, skip_temp_dirs=False)
         projects = detector.scan()
 
         assert len(projects) == 1
@@ -75,7 +75,7 @@ class TestProjectDetector:
 
     def test_has_progress_detection(self, sample_project_dir: Path):
         """Test PROGRESS.md file detection."""
-        detector = ProjectDetector(sample_project_dir.parent)
+        detector = ProjectDetector(sample_project_dir.parent, skip_temp_dirs=False)
         projects = detector.scan()
 
         assert len(projects) == 1
@@ -83,7 +83,7 @@ class TestProjectDetector:
 
     def test_progress_files_list(self, sample_project_dir: Path):
         """Test that all progress files are listed."""
-        detector = ProjectDetector(sample_project_dir.parent)
+        detector = ProjectDetector(sample_project_dir.parent, skip_temp_dirs=False)
         projects = detector.scan()
 
         assert len(projects) == 1
@@ -102,7 +102,7 @@ class TestProjectDetector:
         visible.mkdir()
         (visible / "package.json").write_text('{"name": "visible"}')
 
-        detector = ProjectDetector(temp_dir)
+        detector = ProjectDetector(temp_dir, skip_temp_dirs=False)
         projects = detector.scan()
 
         assert len(projects) == 1
@@ -119,7 +119,7 @@ class TestProjectDetector:
         node_modules.mkdir(parents=True)
         (node_modules / "package.json").write_text('{"name": "some-package"}')
 
-        detector = ProjectDetector(temp_dir)
+        detector = ProjectDetector(temp_dir, skip_temp_dirs=False)
         projects = detector.scan()
 
         # Should only find the main project, not the one in node_modules
@@ -128,7 +128,7 @@ class TestProjectDetector:
 
     def test_empty_directory(self, temp_dir: Path):
         """Test scanning empty directory returns no projects."""
-        detector = ProjectDetector(temp_dir)
+        detector = ProjectDetector(temp_dir, skip_temp_dirs=False)
         projects = detector.scan()
         assert len(projects) == 0
 
@@ -138,7 +138,7 @@ class TestProjectDetector:
         no_markers.mkdir()
         (no_markers / "random.txt").write_text("Just a random file")
 
-        detector = ProjectDetector(temp_dir)
+        detector = ProjectDetector(temp_dir, skip_temp_dirs=False)
         projects = detector.scan()
         assert len(projects) == 0
 
@@ -151,7 +151,7 @@ class TestProjectDetector:
             tool_dir.mkdir()
             (tool_dir / "package.json").write_text(f'{{"name": "{name}"}}')
 
-        detector = ProjectDetector(temp_dir)
+        detector = ProjectDetector(temp_dir, skip_temp_dirs=False)
         projects = detector.scan()
 
         for p in projects:
@@ -163,7 +163,7 @@ class TestScanProjects:
 
     def test_scan_projects_function(self, sample_project_dir: Path):
         """Test the scan_projects convenience function."""
-        projects = scan_projects(sample_project_dir.parent)
+        projects = scan_projects(sample_project_dir.parent, skip_temp_dirs=False)
 
         assert len(projects) == 1
         assert projects[0].name == "sample-project"
@@ -175,7 +175,7 @@ class TestScanProjects:
             proj_dir.mkdir()
             (proj_dir / "package.json").write_text(f'{{"name": "{name}"}}')
 
-        projects = scan_projects(temp_dir)
+        projects = scan_projects(temp_dir, skip_temp_dirs=False)
         names = [p.name for p in projects]
         assert names == ["alpha", "mango", "zebra"]
 
