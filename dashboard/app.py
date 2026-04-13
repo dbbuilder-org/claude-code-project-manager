@@ -945,6 +945,12 @@ def render_agents_tab(df: pd.DataFrame):
         if result_rows:
             result_df = pd.DataFrame(result_rows)
             st.dataframe(result_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇ Download Results (CSV)",
+                result_df.to_csv(index=False),
+                file_name=f"agent-run-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv",
+                mime="text/csv",
+            )
 
         col_a, col_b, col_c = st.columns(3)
         col_a.metric("Assessed", coord.total_projects)
@@ -1046,7 +1052,7 @@ def render_projects_tab(df: pd.DataFrame):
         filter_tags = st.multiselect(tags_label, all_tags, key="_sel_tags", placeholder="Tags...")
 
     with ctrl5:
-        bcol1, bcol2, bcol3 = st.columns(3)
+        bcol1, bcol2, bcol3, bcol4 = st.columns(4)
         with bcol1:
             if st.button("🚀 Top 10", use_container_width=True):
                 sorted_df = df.sort_values(sort_col, ascending=sort_asc, na_position="last").head(10)
@@ -1068,6 +1074,12 @@ def render_projects_tab(df: pd.DataFrame):
                     st.success(f"Generated: {f}")
                 else:
                     st.error("Generation failed")
+        with bcol4:
+            if st.button("✕ Clear Filters", use_container_width=True):
+                for k in ("_sel_cat", "_sel_type", "_sel_tags"):
+                    if k in st.session_state:
+                        del st.session_state[k]
+                st.rerun()
 
     # Bulk tag bar (shows when projects are selected)
     if st.session_state.selected:

@@ -1,8 +1,11 @@
 """CLI interface for project manager."""
 
 import json
+import os
+import platform
 import re
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -32,50 +35,12 @@ from .terminal import (
     is_shutdown_supported,
     _escape_applescript,
 )
+from .filtering import apply_project_filter
 
 
 console = Console()
 
-
-def apply_project_filter(query, filter_str: Optional[str]):
-    """Apply a filter string to a SQLAlchemy Project query.
-
-    Supported filters:
-        type:<category>    e.g. type:client
-        priority:<1-5>     e.g. priority:1
-        overdue            projects past their deadline
-        tagged:<tag>       projects with a specific tag
-        status:active      completion < 100
-        status:complete    completion >= 100
-    """
-    if not filter_str:
-        return query
-
-    from .database.models import Project as _Project
-    from datetime import datetime as _dt
-
-    if filter_str.startswith("type:"):
-        category = filter_str.split(":", 1)[1]
-        query = query.filter(_Project.category == category)
-    elif filter_str.startswith("priority:"):
-        try:
-            p = int(filter_str.split(":", 1)[1])
-            query = query.filter(_Project.priority == p)
-        except ValueError:
-            pass
-    elif filter_str == "overdue":
-        query = query.filter(_Project.deadline < _dt.now(timezone.utc).replace(tzinfo=None))
-    elif filter_str.startswith("tagged:"):
-        tag = filter_str.split(":", 1)[1]
-        query = query.filter(_Project.tags.ilike(f"%{tag}%"))
-    elif filter_str.startswith("status:"):
-        s = filter_str.split(":", 1)[1]
-        if s == "active":
-            query = query.filter(_Project.completion_pct < 100)
-        elif s == "complete":
-            query = query.filter(_Project.completion_pct >= 100)
-
-    return query
+_IMESSAGE_PHONE = os.environ.get("PM_IMESSAGE_PHONE", "+12064962555")
 
 
 @click.group()
@@ -425,7 +390,6 @@ def continue_project(
 @click.option("--port", "-p", default=8501, help="Dashboard port")
 def dashboard(port: int):
     """Launch the Streamlit dashboard."""
-    import sys
     dashboard_path = Path(__file__).parent.parent / "dashboard" / "app.py"
 
     if not dashboard_path.exists():
@@ -1126,7 +1090,7 @@ def brief(days: int, verbose: bool, imessage: bool, only_if_urgent: bool):
     Examples:
         pm brief                      # Morning briefing to terminal
         pm brief --verbose            # Include next actions
-        pm brief --imessage           # Send to iMessage (+12064962555)
+        pm brief --imessage           # Send to iMessage (PM_IMESSAGE_PHONE env, default +12064962555)
         pm brief --only-if-urgent     # Suppress if nothing needs attention
     """
 
@@ -1146,7 +1110,7 @@ def brief(days: int, verbose: bool, imessage: bool, only_if_urgent: bool):
     if imessage:
         # Send via iMessage using AppleScript
         message = format_brief_imessage(brief_data)
-        phone = "+12064962555"
+        phone = _IMESSAGE_PHONE
         escaped = message.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "")
         script = f'tell application "Messages" to send "{escaped}" to buddy "{phone}" of service "SMS"'
         try:
@@ -1458,7 +1422,6 @@ def list_transcripts(project_name: Optional[str], limit: int):
         return
 
     if project_name:
-        import re as _re
         safe_name = re.sub(r'[^\w\-]', '_', project_name)
         dirs = [transcript_base / safe_name]
     else:
@@ -2817,9 +2780,6 @@ def triage(limit: int, imessage: bool, dry_run: bool, timeout: int):
         pm triage              # Show recommendations in terminal
         pm triage --imessage   # Send each recommendation via iMessage
     """
-    import json as _json
-    import re as _re
-
     init_db()
     with db_session() as session:
         projects = (
@@ -2872,9 +2832,9 @@ def triage(limit: int, imessage: bool, dry_run: bool, timeout: int):
             raw = result.stdout.strip()
 
             # Extract JSON
-            json_match = _re.search(r'\{.*?"confidence".*?\}', raw, _re.DOTALL)
+            json_match = re.search(r'\{.*?"confidence".*?\}', raw, re.DOTALL)
             if json_match:
-                data = _json.loads(json_match.group(0))
+                data = json.loads(json_match.group(0))
                 decision = data.get("decision_summary", "Unknown decision")
                 option = data.get("recommended_option", "?")
                 reasoning = data.get("recommendation", "")
@@ -2918,7 +2878,7 @@ def triage(limit: int, imessage: bool, dry_run: bool, timeout: int):
         console.print()
 
 
-def _send_imessage_triage(message: str, phone: str = "+12064962555") -> None:
+def _send_imessage_triage(message: str, phone: str = _IMESSAGE_PHONE) -> None:
     """Send a triage recommendation via iMessage."""
     escaped_msg = _escape_applescript(message)
     escaped_phone = _escape_applescript(phone)
@@ -2998,7 +2958,6 @@ def schedule():
 @click.option("--dry-run-agent", is_flag=True, help="Schedule in dry-run mode (assess only)")
 def schedule_install(hour: int, limit: int, budget: float, workers: int, dry_run_agent: bool):
     """Install nightly agent batch launchd job."""
-    import platform
     if platform.system() != "Darwin":
         console.print("[red]schedule only supported on macOS (launchd)[/red]")
         raise SystemExit(1)
@@ -3027,7 +2986,6 @@ def schedule_install(hour: int, limit: int, budget: float, workers: int, dry_run
 @schedule.command("uninstall")
 def schedule_uninstall():
     """Remove nightly agent batch launchd job."""
-    import platform
     if platform.system() != "Darwin":
         console.print("[red]schedule only supported on macOS (launchd)[/red]")
         raise SystemExit(1)

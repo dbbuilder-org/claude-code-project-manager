@@ -41,6 +41,9 @@ pip install -e . -q
 echo "Installing development dependencies..."
 pip install -e ".[dev]" -q
 
+# Create logs directory for launchd jobs
+mkdir -p logs
+
 echo ""
 echo "============================================"
 echo "  Setup Complete!"

@@ -1,6 +1,8 @@
 """SQLAlchemy models for project tracking."""
 
+import json
 import os
+import re
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -197,7 +199,6 @@ class Project(Base):
     def tags_list(self) -> list[str]:
         """Parse tags JSON to list."""
         if self.tags:
-            import json
             try:
                 return json.loads(self.tags)
             except json.JSONDecodeError:
@@ -353,6 +354,17 @@ _TABLE_MIGRATIONS = [
 ]
 
 
+_SAFE_IDENTIFIER = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+_SAFE_SQL_TYPE = re.compile(r'^[A-Z]+(\s+(DEFAULT\s+\S+|NOT\s+NULL|\d+))*$', re.IGNORECASE)
+
+
+def _validate_sql_identifier(name: str) -> str:
+    """Raise ValueError if name is not a safe SQL identifier."""
+    if not _SAFE_IDENTIFIER.match(name):
+        raise ValueError(f"Unsafe SQL identifier rejected: {name!r}")
+    return name
+
+
 def _migrate_db(engine) -> None:
     """Run schema migrations transactionally; skip already-applied versions."""
     from sqlalchemy import inspect, text
@@ -390,7 +402,7 @@ def _migrate_db(engine) -> None:
                     for col_name, col_type in columns:
                         if col_name not in existing_columns:
                             conn.execute(text(
-                                f"ALTER TABLE projects ADD COLUMN {col_name} {col_type}"
+                                f"ALTER TABLE projects ADD COLUMN {_validate_sql_identifier(col_name)} {col_type}"
                             ))
 
                 # Other-table ALTER TABLEs for this version
@@ -405,7 +417,7 @@ def _migrate_db(engine) -> None:
                     }
                     if col_name not in existing_cols:
                         conn.execute(text(
-                            f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"
+                            f"ALTER TABLE {_validate_sql_identifier(table_name)} ADD COLUMN {_validate_sql_identifier(col_name)} {col_type}"
                         ))
 
                 conn.execute(
