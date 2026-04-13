@@ -1,6 +1,6 @@
 """Tests for pm.terminal module — detection, script generation, shutdown support."""
 
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock, call
 
 from pm.terminal import (
     TerminalApp,
@@ -11,6 +11,9 @@ from pm.terminal import (
     launch_single_terminal,
     launch_batch_iterm,
     launch_batch_terminal,
+    launch_single,
+    launch_batch,
+    _escape_applescript,
 )
 
 
@@ -172,3 +175,100 @@ class TestTerminalAppEnum:
     def test_values(self):
         assert TerminalApp.ITERM2.value == "iterm2"
         assert TerminalApp.TERMINAL.value == "terminal"
+
+
+# ── _escape_applescript injection hardening ────────────────────────────────
+
+
+class TestEscapeAppleScript:
+    def test_escapes_backslash(self):
+        assert "\\\\" in _escape_applescript("path\\to\\file")
+
+    def test_escapes_double_quote(self):
+        assert '\\"' in _escape_applescript('say "hello"')
+
+    def test_strips_newline(self):
+        result = _escape_applescript("line1\nline2")
+        assert "\n" not in result
+        assert "line1" in result
+        assert "line2" in result
+
+    def test_strips_carriage_return(self):
+        result = _escape_applescript("line1\rline2")
+        assert "\r" not in result
+
+    def test_strips_null_byte(self):
+        result = _escape_applescript("before\x00after")
+        assert "\x00" not in result
+        assert "before" in result
+        assert "after" in result
+
+    def test_normal_text_unchanged(self):
+        text = "my-project"
+        assert _escape_applescript(text) == text
+
+    def test_injection_attempt_sanitised(self):
+        # A malicious project name that tries to break out of string context
+        malicious = 'proj"\nend tell\ntell application "Finder" to delete disk'
+        result = _escape_applescript(malicious)
+        assert "\n" not in result
+        assert "end tell" not in result or '\\"' in result  # either stripped or escaped
+
+
+# ── launch_single (subprocess.Popen mock) ─────────────────────────────────
+
+
+class TestLaunchSingle:
+    @patch("pm.terminal.subprocess.Popen")
+    @patch("pm.terminal.ensure_running")
+    def test_calls_popen_with_osascript(self, mock_ensure, mock_popen):
+        result = launch_single("/proj", "test", "cmd", terminal=TerminalApp.ITERM2)
+        mock_popen.assert_called_once()
+        args = mock_popen.call_args[0][0]
+        assert args[0] == "osascript"
+        assert args[1] == "-e"
+
+    @patch("pm.terminal.subprocess.Popen")
+    @patch("pm.terminal.ensure_running")
+    def test_returns_terminal_type(self, mock_ensure, mock_popen):
+        result = launch_single("/proj", "test", "cmd", terminal=TerminalApp.ITERM2)
+        assert result == TerminalApp.ITERM2
+
+    @patch("pm.terminal.subprocess.Popen")
+    @patch("pm.terminal.ensure_running")
+    def test_terminal_app_uses_terminal_script(self, mock_ensure, mock_popen):
+        launch_single("/proj", "test", "cmd", terminal=TerminalApp.TERMINAL)
+        script = mock_popen.call_args[0][0][2]
+        assert "Terminal" in script
+
+    @patch("pm.terminal.subprocess.Popen")
+    @patch("pm.terminal.ensure_running")
+    def test_iterm2_uses_iterm_script(self, mock_ensure, mock_popen):
+        launch_single("/proj", "test", "cmd", terminal=TerminalApp.ITERM2)
+        script = mock_popen.call_args[0][0][2]
+        assert "iTerm" in script
+
+
+# ── launch_batch (subprocess.Popen mock) ──────────────────────────────────
+
+
+class TestLaunchBatch:
+    @patch("pm.terminal.subprocess.Popen")
+    @patch("pm.terminal.ensure_running")
+    def test_calls_popen_for_multiple_projects(self, mock_ensure, mock_popen):
+        projects = [("/p1", "p1", "cmd1"), ("/p2", "p2", "cmd2")]
+        launch_batch(projects, terminal=TerminalApp.ITERM2)
+        mock_popen.assert_called_once()
+
+    @patch("pm.terminal.subprocess.Popen")
+    @patch("pm.terminal.ensure_running")
+    def test_empty_list_no_popen(self, mock_ensure, mock_popen):
+        result = launch_batch([], terminal=TerminalApp.ITERM2)
+        mock_popen.assert_not_called()
+
+    @patch("pm.terminal.subprocess.Popen")
+    @patch("pm.terminal.ensure_running")
+    def test_returns_terminal_type(self, mock_ensure, mock_popen):
+        projects = [("/p1", "p1", "cmd1")]
+        result = launch_batch(projects, terminal=TerminalApp.TERMINAL)
+        assert result == TerminalApp.TERMINAL

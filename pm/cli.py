@@ -6,7 +6,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional
 
 import click
@@ -63,7 +63,7 @@ def apply_project_filter(query, filter_str: Optional[str]):
         except ValueError:
             pass
     elif filter_str == "overdue":
-        query = query.filter(_Project.deadline < _dt.utcnow())
+        query = query.filter(_Project.deadline < _dt.now(timezone.utc).replace(tzinfo=None))
     elif filter_str.startswith("tagged:"):
         tag = filter_str.split(":", 1)[1]
         query = query.filter(_Project.tags.ilike(f"%{tag}%"))
@@ -136,7 +136,7 @@ def scan(base_path: str, verbose: bool):
             proj.name = proj_info.name
             proj.project_type = proj_info.project_type
             proj.category = proj_info.category
-            proj.last_scanned = datetime.utcnow()
+            proj.last_scanned = datetime.now(timezone.utc).replace(tzinfo=None)
 
             # Progress state
             proj.completion_pct = proj_progress.completion_pct
@@ -155,6 +155,7 @@ def scan(base_path: str, verbose: bool):
 
             # Files
             proj.has_claude_md = proj_info.has_claude_md
+            proj.has_readme = proj_info.has_readme
             proj.has_todo = proj_info.has_todo
             proj.has_progress = proj_info.has_progress
             proj.progress_files = json.dumps(proj_info.progress_files)
@@ -536,7 +537,7 @@ def health(filter_str: Optional[str], limit: int, asc: bool):
 
         # Last activity
         if p.last_activity:
-            days = (datetime.utcnow() - p.last_activity).days
+            days = (datetime.now(timezone.utc).replace(tzinfo=None) - p.last_activity).days
             if days == 0:
                 activity = "today"
             elif days == 1:
@@ -1252,7 +1253,7 @@ def stale(days: int, action: bool):
     init_db()
     session = get_session()
 
-    threshold = datetime.utcnow() - timedelta(days=days)
+    threshold = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
     projects = session.query(Project).filter(
         (Project.archived == False) | (Project.archived == None),
         Project.priority != 5,
@@ -1274,7 +1275,7 @@ def stale(days: int, action: bool):
     table.add_column("Notes")
 
     for p in projects:
-        days_inactive = (datetime.utcnow() - p.last_activity).days if p.last_activity else "—"
+        days_inactive = (datetime.now(timezone.utc).replace(tzinfo=None) - p.last_activity).days if p.last_activity else "—"
         activity = p.last_activity.strftime("%Y-%m-%d") if p.last_activity else "never"
         notes_preview = (p.notes[:30] + "...") if p.notes and len(p.notes) > 30 else (p.notes or "")
 
@@ -1302,7 +1303,7 @@ def _prompt_stale_action(session, project: Project) -> None:
     """Prompt user for action on a stale project (interactive CLI)."""
     console.print(f"\n[bold]{project.name}[/bold] — {project.path}")
     if project.last_activity:
-        days_ago = (datetime.utcnow() - project.last_activity).days
+        days_ago = (datetime.now(timezone.utc).replace(tzinfo=None) - project.last_activity).days
         console.print(f"  Last active: {project.last_activity.strftime('%Y-%m-%d')} ({days_ago}d ago)")
     else:
         console.print("  Last active: never")
@@ -1320,7 +1321,7 @@ def _prompt_stale_action(session, project: Project) -> None:
         reason = click.prompt("  Reason (optional)", default="", show_default=False)
         project.archived = True
         if reason:
-            project.notes = f"{project.notes or ''}\n\n[Archived {datetime.utcnow().strftime('%Y-%m-%d')}] {reason}".strip()
+            project.notes = f"{project.notes or ''}\n\n[Archived {datetime.now(timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d')}] {reason}".strip()
         session.commit()
         _sync_project(project)
         console.print(f"  [green]✓ Archived {project.name}[/green]")
@@ -1336,7 +1337,7 @@ def _prompt_stale_action(session, project: Project) -> None:
 
     elif choice == "3":
         direction = click.prompt("  New direction")
-        project.notes = f"{project.notes or ''}\n\n[Pivot {datetime.utcnow().strftime('%Y-%m-%d')}] {direction}".strip()
+        project.notes = f"{project.notes or ''}\n\n[Pivot {datetime.now(timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d')}] {direction}".strip()
         session.commit()
         _sync_project(project)
         console.print(f"  [green]✓ Updated notes for {project.name}[/green]")
@@ -1351,7 +1352,7 @@ def _prompt_stale_action(session, project: Project) -> None:
         target = session.query(Project).filter(Project.name.ilike(f"%{target_name}%")).first()
         if target:
             project.archived = True
-            project.notes = f"{project.notes or ''}\n\n[Combined into {target.name} on {datetime.utcnow().strftime('%Y-%m-%d')}]".strip()
+            project.notes = f"{project.notes or ''}\n\n[Combined into {target.name} on {datetime.now(timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d')}]".strip()
             session.commit()
             _sync_project(project)
             console.print(f"  [green]✓ Archived {project.name}, combined into {target.name}[/green]")
@@ -1363,7 +1364,7 @@ def _prompt_stale_action(session, project: Project) -> None:
         repl = session.query(Project).filter(Project.name.ilike(f"%{repl_name}%")).first()
         if repl:
             project.archived = True
-            project.notes = f"{project.notes or ''}\n\n[Replaced by {repl.name} on {datetime.utcnow().strftime('%Y-%m-%d')}]".strip()
+            project.notes = f"{project.notes or ''}\n\n[Replaced by {repl.name} on {datetime.now(timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d')}]".strip()
             session.commit()
             _sync_project(project)
             console.print(f"  [green]✓ Archived {project.name}, replaced by {repl.name}[/green]")
@@ -1460,12 +1461,12 @@ def run_prompt(project_name: str, prompt: str, budget: float, timeout: int, tool
     safe_name = re.sub(r'[^\w\-]', '_', project.name)
     transcript_dir = Path(__file__).parent.parent / "transcripts" / safe_name
     transcript_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    timestamp = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y%m%d-%H%M%S")
     transcript_file = transcript_dir / f"{timestamp}.md"
 
     transcript_content = f"""# Prompt Run: {project.name}
 
-- **Date:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}
+- **Date:** {datetime.now(timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S UTC')}
 - **Status:** {status}
 - **Duration:** {duration:.1f}s
 - **Budget:** ${budget:.2f}
@@ -1654,21 +1655,133 @@ def launch(target: str, dirty_only: bool, dry_run: bool, terminal: bool):
     session.close()
 
 
+def _shutdown_terminal_app(no_context: bool, dry_run: bool, context_wait: int) -> None:
+    """Shutdown Claude Code sessions in Terminal.app.
+
+    Terminal.app doesn't support session enumeration by name, so this targets all
+    open Terminal.app tabs, sends the context command and /exit to each one.
+    """
+    # Count Terminal.app windows/tabs
+    count_script = '''
+    tell application "Terminal"
+        set total to 0
+        repeat with w in windows
+            set total to total + (count of tabs of w)
+        end repeat
+        return total
+    end tell
+    '''
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", count_script],
+            capture_output=True, text=True, check=True
+        )
+        tab_count = int(result.stdout.strip())
+    except (subprocess.CalledProcessError, ValueError):
+        tab_count = 0
+
+    if tab_count == 0:
+        console.print("[yellow]No Terminal.app tabs found.[/yellow]")
+        return
+
+    console.print(f"Found [cyan]{tab_count}[/cyan] Terminal.app tab(s)")
+
+    if dry_run:
+        console.print("\n[dim]Dry run - would perform:[/dim]")
+        if not no_context:
+            console.print(f"  1. Send 'write context to docs/PROJECT-CONTEXT.md' to each tab")
+            console.print(f"  2. Wait {context_wait} seconds")
+        console.print("  3. Send '/exit' to each tab")
+        return
+
+    if not click.confirm(f"Shutdown {tab_count} Terminal.app tab(s)?", default=True):
+        console.print("[yellow]Cancelled[/yellow]")
+        return
+
+    # Get window/tab structure
+    structure_script = '''
+    tell application "Terminal"
+        set result to ""
+        set wIdx to 1
+        repeat with w in windows
+            set tIdx to 1
+            repeat with t in tabs of w
+                set result to result & wIdx & "," & tIdx & "\n"
+                set tIdx to tIdx + 1
+            end repeat
+            set wIdx to wIdx + 1
+        end repeat
+        return result
+    end tell
+    '''
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", structure_script],
+            capture_output=True, text=True, check=True
+        )
+        tabs = []
+        for line in result.stdout.strip().split('\n'):
+            if line.strip():
+                parts = line.strip().split(',')
+                if len(parts) == 2:
+                    tabs.append((int(parts[0]), int(parts[1])))
+    except (subprocess.CalledProcessError, ValueError) as e:
+        console.print(f"[red]Failed to enumerate Terminal.app tabs: {e}[/red]")
+        return
+
+    for w_idx, t_idx in tabs:
+        tab_id = f"w{w_idx}t{t_idx}"
+        if not no_context:
+            ctx_script = f'''
+            tell application "Terminal"
+                do script "write context to docs/PROJECT-CONTEXT.md" in tab {t_idx} of window {w_idx}
+            end tell
+            '''
+            try:
+                subprocess.run(["osascript", "-e", ctx_script], capture_output=True, check=True)
+                console.print(f"  [green]✓[/green] {tab_id}: Sent context command")
+            except subprocess.CalledProcessError:
+                console.print(f"  [yellow]![/yellow] {tab_id}: Could not send context command")
+
+    if not no_context:
+        console.print(f"[dim]Waiting {context_wait}s for context to be written...[/dim]")
+        time.sleep(context_wait)
+
+    for w_idx, t_idx in tabs:
+        tab_id = f"w{w_idx}t{t_idx}"
+        exit_script = f'''
+        tell application "Terminal"
+            do script "/exit" in tab {t_idx} of window {w_idx}
+        end tell
+        '''
+        try:
+            subprocess.run(["osascript", "-e", exit_script], capture_output=True, check=True)
+            console.print(f"  [green]✓[/green] {tab_id}: Sent /exit")
+        except subprocess.CalledProcessError:
+            console.print(f"  [yellow]![/yellow] {tab_id}: Could not send /exit")
+
+    console.print("\n[bold green]Terminal.app shutdown complete![/bold green]")
+    console.print("[dim]Note: Terminal.app windows remain open — close them manually.[/dim]")
+
+
 @main.command()
 @click.option("--no-context", is_flag=True, help="Skip writing context docs before shutdown")
 @click.option("--dry-run", is_flag=True, help="Show what would be done without executing")
 @click.option("--context-wait", default=60, help="Seconds to wait after context command (default: 60)")
 def shutdown(no_context: bool, dry_run: bool, context_wait: int):
-    """Gracefully shutdown all Claude Code sessions in iTerm2.
+    """Gracefully shutdown all Claude Code sessions.
 
-    For each iTerm2 tab:
+    For iTerm2 (full support): For each tab:
     1. Send 'write context to docs/PROJECT-CONTEXT.md' (unless --no-context)
     2. Wait for context to be written (default 60s)
     3. Send '/exit' to close Claude
     4. Wait 5 seconds
     5. Close the tab
+    Sessions processed in parallel with 2 second stagger.
 
-    Sessions are processed in parallel with 2 second stagger.
+    For Terminal.app (limited support):
+    - Sends context command and /exit to each tab
+    - Windows remain open (Terminal.app cannot be closed programmatically)
 
     Examples:
         pm shutdown              # Graceful shutdown with context save
@@ -1676,10 +1789,11 @@ def shutdown(no_context: bool, dry_run: bool, context_wait: int):
         pm shutdown --dry-run    # Preview what would happen
     """
 
-    # Shutdown requires iTerm2 — Terminal.app doesn't support session enumeration
-    if not is_shutdown_supported():
-        console.print("[yellow]Shutdown requires iTerm2 (not installed).[/yellow]")
-        console.print("[dim]Terminal.app does not support session enumeration or named tabs.[/dim]")
+    # Detect terminal; dispatch to appropriate shutdown handler
+    from .terminal import detect_terminal, TerminalApp
+    terminal = detect_terminal()
+    if not is_shutdown_supported(terminal):
+        _shutdown_terminal_app(no_context, dry_run, context_wait)
         return
 
     # AppleScript to get all iTerm2 tab info
@@ -2032,7 +2146,7 @@ def docs_generate(
 
                 if recent and recent.generated_at:
                     from datetime import timedelta
-                    age = datetime.utcnow() - recent.generated_at
+                    age = datetime.now(timezone.utc).replace(tzinfo=None) - recent.generated_at
                     if age < timedelta(days=stale_days):
                         if not dry_run:
                             console.print(
@@ -2137,7 +2251,7 @@ def docs_generate(
             project_id=task["project_id"],
             template_id=task["template_id"],
             output_path=task["output_rel"],
-            generated_at=datetime.utcnow(),
+            generated_at=datetime.now(timezone.utc).replace(tzinfo=None),
             duration_secs=result.duration_secs,
             status=result.status,
             error_message=result.error_message if result.status != "success" else None,
@@ -2282,7 +2396,7 @@ def docs_status(project_name: Optional[str], stale_days: int):
     for tid in template_ids:
         table.add_column(tid, width=14)
 
-    stale_threshold = datetime.utcnow() - timedelta(days=stale_days)
+    stale_threshold = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=stale_days)
 
     for proj in projects:
         row = [proj.name]
@@ -2296,7 +2410,7 @@ def docs_status(project_name: Optional[str], stale_days: int):
             ).order_by(DocGeneration.generated_at.desc()).first()
 
             if latest and latest.generated_at:
-                age_days = (datetime.utcnow() - latest.generated_at).days
+                age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - latest.generated_at).days
                 if latest.generated_at < stale_threshold:
                     row.append(f"[yellow]{age_days}d ago[/yellow]")
                 else:
@@ -2332,7 +2446,7 @@ def _record_agent_run(
     from .database.models import AgentRun
     try:
         session = get_session()
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         total_duration = (now - started).total_seconds()
         run = AgentRun(
             project_id=project_id,
@@ -2460,7 +2574,7 @@ def agent_run(
         console.print(f"[red]No project found matching '{project_name}'[/red]")
         return
 
-    started = datetime.utcnow()
+    started = datetime.now(timezone.utc).replace(tzinfo=None)
 
     # Phase 1: Assess
     console.print(f"[bold blue]Phase 1: Assessing {project.name}...[/bold blue]")
@@ -2671,7 +2785,7 @@ def agent_costs(days: int, limit: int):
     from .database.models import AgentRun
     from sqlalchemy import func
 
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
 
     session = get_session()
 

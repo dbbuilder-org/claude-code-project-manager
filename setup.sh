@@ -23,6 +23,12 @@ fi
 echo "Activating virtual environment..."
 source venv/bin/activate
 
+# Guard: confirm we're inside a venv before installing anything
+if [ -z "$VIRTUAL_ENV" ]; then
+    echo "ERROR: Failed to activate virtual environment. Aborting to avoid system-Python install."
+    exit 1
+fi
+
 # Upgrade pip
 echo "Upgrading pip..."
 pip install --upgrade pip -q

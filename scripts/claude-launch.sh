@@ -19,13 +19,29 @@ GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Detect which terminal to use
+# Detect which terminal to use via pm.terminal.detect_terminal() (canonical source)
 # Sets TERMINAL_APP to "iterm" or "terminal"
 detect_terminal() {
-    if [ -d "/Applications/iTerm.app" ]; then
-        TERMINAL_APP="iterm"
+    local detected
+    detected=$(
+        cd "$PROJECT_MANAGER_DIR" && \
+        source venv/bin/activate 2>/dev/null || true && \
+        python3 -c "
+from pm.terminal import detect_terminal as _detect, TerminalApp
+t = _detect()
+print('iterm' if t == TerminalApp.ITERM2 else 'terminal')
+" 2>/dev/null
+    ) || true
+
+    if [ "$detected" = "iterm" ] || [ "$detected" = "terminal" ]; then
+        TERMINAL_APP="$detected"
     else
-        TERMINAL_APP="terminal"
+        # Fallback if Python fails
+        if [ -d "/Applications/iTerm.app" ]; then
+            TERMINAL_APP="iterm"
+        else
+            TERMINAL_APP="terminal"
+        fi
     fi
     echo -e "${BLUE}Using terminal:${NC} $TERMINAL_APP"
 }

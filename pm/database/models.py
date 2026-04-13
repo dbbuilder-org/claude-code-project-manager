@@ -1,13 +1,18 @@
 """SQLAlchemy models for project tracking."""
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from sqlalchemy import create_engine, Column, String, Float, Boolean, DateTime, Integer, Text, ForeignKey
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
 
 Base = declarative_base()
+
+
+def _utcnow() -> datetime:
+    """Naive UTC datetime — timezone.utc stripped for SQLite compatibility."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 # Canonical priority label mapping — import this instead of redefining locally
 PRIORITY_LABELS: dict[int, str] = {
@@ -49,6 +54,7 @@ class Project(Base):
 
     # Files found
     has_claude_md = Column(Boolean, default=False)
+    has_readme = Column(Boolean, default=False)
     has_todo = Column(Boolean, default=False)
     has_progress = Column(Boolean, default=False)
     progress_files = Column(Text)  # JSON list
@@ -73,14 +79,14 @@ class Project(Base):
     def days_until_deadline(self) -> Optional[int]:
         """Days until deadline (negative if overdue)."""
         if self.deadline:
-            return (self.deadline - datetime.utcnow()).days
+            return (self.deadline - _utcnow()).days
         return None
 
     @property
     def days_until_target(self) -> Optional[int]:
         """Days until target date (negative if past)."""
         if self.target_date:
-            return (self.target_date - datetime.utcnow()).days
+            return (self.target_date - _utcnow()).days
         return None
 
     @property
@@ -128,8 +134,9 @@ class Project(Base):
         """Calculate project health score (0-100).
 
         Factors:
-        - Completion progress (0-30 pts)
+        - Completion progress (0-25 pts)
         - Has CLAUDE.md (10 pts)
+        - Has README.md (5 pts)
         - Has progress tracking files (10 pts)
         - Recent activity (0-20 pts)
         - No pending decisions (10 pts)
@@ -138,13 +145,17 @@ class Project(Base):
         """
         score = 0
 
-        # Completion (0-30 pts)
+        # Completion (0-25 pts)
         if self.completion_pct is not None:
-            score += int(self.completion_pct * 0.3)
+            score += int(self.completion_pct * 0.25)
 
         # Has CLAUDE.md (10 pts)
         if self.has_claude_md:
             score += 10
+
+        # Has README.md (5 pts)
+        if self.has_readme:
+            score += 5
 
         # Has progress files (10 pts)
         if self.has_todo or self.has_progress:
@@ -152,7 +163,7 @@ class Project(Base):
 
         # Recent activity (0-20 pts)
         if self.last_activity:
-            days_ago = (datetime.utcnow() - self.last_activity).days
+            days_ago = (_utcnow() - self.last_activity).days
             if days_ago <= 7:
                 score += 20
             elif days_ago <= 14:
@@ -226,7 +237,7 @@ class Project(Base):
             return False
         if self.last_activity is None:
             return True
-        return (datetime.utcnow() - self.last_activity).days >= 30
+        return (_utcnow() - self.last_activity).days >= 30
 
 
 class ProgressItem(Base):
@@ -253,7 +264,7 @@ class ScanHistory(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     project_id = Column(String, ForeignKey("projects.id"), nullable=False)
 
-    scanned_at = Column(DateTime, default=datetime.utcnow)
+    scanned_at = Column(DateTime, default=_utcnow)
     completion_pct = Column(Float)
     items_total = Column(Integer)
     items_complete = Column(Integer)
@@ -271,7 +282,7 @@ class DocGeneration(Base):
     project_id = Column(String, ForeignKey("projects.id"), nullable=False)
     template_id = Column(String, nullable=False)  # "roadmap", "architecture", etc.
     output_path = Column(String)  # Relative path from project root
-    generated_at = Column(DateTime, default=datetime.utcnow)
+    generated_at = Column(DateTime, default=_utcnow)
     duration_secs = Column(Float)
     status = Column(String)  # "success", "error", "timeout"
     error_message = Column(Text)
@@ -288,7 +299,7 @@ class AgentRun(Base):
     project_id = Column(String, ForeignKey("projects.id"), nullable=False)
 
     # Timing
-    started_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, default=_utcnow)
     completed_at = Column(DateTime)
     duration_secs = Column(Float)
 
@@ -330,6 +341,9 @@ _MIGRATIONS = [
         ("archived", "BOOLEAN DEFAULT 0"),
     ]),
     (2, "AgentRun cost tracking", []),  # New column added via table create; alter handled below
+    (3, "has_readme column", [
+        ("has_readme", "BOOLEAN DEFAULT 0"),
+    ]),
 ]
 
 # Column additions outside of 'projects' table (table_name, col_name, sql_type)
@@ -395,7 +409,7 @@ def _migrate_db(engine) -> None:
 
                 conn.execute(
                     text("INSERT INTO schema_migrations (version, applied_at) VALUES (:v, :ts)"),
-                    {"v": version, "ts": datetime.utcnow().isoformat()}
+                    {"v": version, "ts": _utcnow().isoformat()}
                 )
                 conn.commit()
             except Exception as e:

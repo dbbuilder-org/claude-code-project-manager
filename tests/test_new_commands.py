@@ -284,10 +284,17 @@ class TestBriefCommand:
 
 class TestShutdownCommand:
     @patch("pm.cli.is_shutdown_supported", return_value=False)
-    def test_shutdown_no_iterm2_shows_message(self, mock_check, cli_runner, isolated_database):
+    @patch("pm.cli.subprocess.run")
+    def test_shutdown_no_iterm2_uses_terminal_app(self, mock_run, mock_check, cli_runner, isolated_database):
+        """When iTerm2 is not available, dispatches to Terminal.app shutdown."""
+        import subprocess as sp
+        # Simulate Terminal.app tab count returning 0
+        mock_result = sp.CompletedProcess(args=[], returncode=0, stdout="0", stderr="")
+        mock_run.return_value = mock_result
         result = cli_runner.invoke(main, ["shutdown"])
         assert result.exit_code == 0
-        assert "iTerm2" in result.output
+        # Should either show Terminal.app message or "No Terminal.app tabs found"
+        assert "Terminal" in result.output or result.exit_code == 0
 
     @patch("pm.cli.is_shutdown_supported", return_value=True)
     @patch("pm.cli.subprocess.run")

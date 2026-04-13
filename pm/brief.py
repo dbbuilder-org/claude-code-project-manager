@@ -1,6 +1,6 @@
 """Morning briefing and anomaly detection for project manager."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -10,7 +10,7 @@ from .database.models import Project, ScanHistory
 
 def _days_inactive(project: Project) -> Optional[int]:
     if project.last_activity:
-        return (datetime.utcnow() - project.last_activity).days
+        return (datetime.now(timezone.utc).replace(tzinfo=None) - project.last_activity).days
     return None
 
 
@@ -25,7 +25,7 @@ def build_brief(session: Session, lookback_days: int = 7) -> dict:
         wins            — 100% completions or large jumps in lookback window
         summary         — one-line overview
     """
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     stale_threshold = now - timedelta(days=30)
     newly_stale_threshold = now - timedelta(days=30 + lookback_days)
     lookback_start = now - timedelta(days=lookback_days)

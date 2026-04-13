@@ -55,7 +55,14 @@ def ensure_running(terminal: TerminalApp) -> None:
 
 
 def _escape_applescript(text: str) -> str:
-    """Escape special characters for AppleScript string literals."""
+    """Escape and sanitize a string for use in AppleScript string literals.
+
+    Strips control characters that could break out of the string context
+    (newlines, carriage returns, null bytes) before escaping backslashes
+    and double-quotes.
+    """
+    # Strip characters that allow AppleScript injection via string termination
+    text = text.replace("\x00", "").replace("\r", "").replace("\n", " ")
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 

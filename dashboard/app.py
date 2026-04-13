@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 
 from pm.database.models import init_db, get_session, Project, DocGeneration, ScanHistory
 from pm.metadata import sync_to_file, sync_project_to_file, PM_STATUS_FILENAME, ProjectMetadata
@@ -23,6 +23,16 @@ from pm.terminal import (
     launch_batch as terminal_launch_batch,
     build_command as terminal_build_command,
 )
+
+def _utcnow() -> datetime:
+    """Naive UTC datetime compatible with SQLite-stored naive datetimes."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _bump_cache():
+    """Invalidate the load_projects cache by incrementing the version key."""
+    st.session_state.cache_version = st.session_state.get("cache_version", 0) + 1
+
 
 # Page config - must be first
 st.set_page_config(
@@ -50,13 +60,17 @@ if "page" not in st.session_state:
     st.session_state.page = 0
 if "last_expanded_id" not in st.session_state:
     st.session_state.last_expanded_id = None
+if "cache_version" not in st.session_state:
+    st.session_state.cache_version = 0
+if "_prev_filters" not in st.session_state:
+    st.session_state._prev_filters = {}
 
 
 # ── Data Loading ────────────────────────────────────────────────────────────
 
 
 @st.cache_data(ttl=120)
-def load_projects():
+def load_projects(_cache_version: int = 0):
     """Load all projects from database with caching."""
     session = get_session()
     try:
@@ -68,7 +82,7 @@ def load_projects():
         for p in projects:
             days_inactive = None
             if p.last_activity:
-                days_inactive = (datetime.utcnow() - p.last_activity).days
+                days_inactive = (_utcnow() - p.last_activity).days
 
             # Truncate commit message
             commit_msg = p.last_commit_msg or ""
@@ -98,6 +112,9 @@ def load_projects():
                 "notes": p.notes or "",
                 "client_name": p.client_name or "",
                 "tags": p.tags_list,
+                "target_date": p.target_date,
+                "budget_hours": p.budget_hours,
+                "hours_logged": p.hours_logged or 0.0,
             })
         return pd.DataFrame(data)
     finally:
@@ -146,8 +163,9 @@ def _save_tags(project_id: str, project_path: str, new_tags: list[str]):
 
 
 def _save_metadata(project_id: str, priority: int, deadline: date | None,
-                   target_date: date | None, notes: str):
-    """Save priority, deadline, target date, and notes to DB and PM-STATUS.md."""
+                   target_date: date | None, notes: str,
+                   budget_hours: float | None = None, hours_logged: float | None = None):
+    """Save priority, deadline, target date, notes, and hours to DB and PM-STATUS.md."""
     session = get_session()
     try:
         project = session.query(Project).filter_by(id=project_id).first()
@@ -156,6 +174,10 @@ def _save_metadata(project_id: str, priority: int, deadline: date | None,
             project.deadline = datetime.combine(deadline, datetime.min.time()) if deadline else None
             project.target_date = datetime.combine(target_date, datetime.min.time()) if target_date else None
             project.notes = notes
+            if budget_hours is not None:
+                project.budget_hours = budget_hours if budget_hours > 0 else None
+            if hours_logged is not None:
+                project.hours_logged = hours_logged
             session.commit()
             _sync_project_to_file(project)
     finally:
@@ -221,12 +243,12 @@ def _run_prompt_on_project(project_path: str, project_name: str, prompt: str,
     # Log transcript
     transcript_dir = Path(__file__).parent.parent / "transcripts" / project_name
     transcript_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    timestamp = _utcnow().strftime("%Y%m%d-%H%M%S")
     transcript_file = transcript_dir / f"{timestamp}.md"
 
     transcript_content = f"""# Prompt Run: {project_name}
 
-- **Date:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}
+- **Date:** {_utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}
 - **Status:** {status}
 - **Duration:** {duration:.1f}s
 - **Budget:** ${budget:.2f}
@@ -290,7 +312,7 @@ def generate_doc(project_path: str, project_name: str, project_id: str, template
             project_id=project_id,
             template_id=template_id,
             output_path=f"{tmpl.output_dir}/{filename}",
-            generated_at=datetime.utcnow(),
+            generated_at=_utcnow(),
             duration_secs=result.duration_secs,
             status=result.status,
             error_message=result.error_message if result.status != "success" else None,
@@ -402,7 +424,7 @@ def render_docs_tab(df: pd.DataFrame):
     st.divider()
 
     st.markdown("**Batch Generation**")
-    bcol1, bcol2, bcol3 = st.columns([1, 1, 4])
+    bcol1, bcol2, bcol3, bcol4 = st.columns([1, 1, 1, 2])
     with bcol1:
         batch_template = st.selectbox(
             "Template",
@@ -413,20 +435,44 @@ def render_docs_tab(df: pd.DataFrame):
         batch_scope = st.selectbox("Scope", ["Top 5 by urgency", "Top 10 by urgency", "All projects"])
 
     with bcol3:
-        if st.button("Generate Batch"):
-            scope_limit = 5 if "5" in batch_scope else (10 if "10" in batch_scope else len(df))
-            target_df = df.nlargest(scope_limit, "urgency")
+        batch_running = st.session_state.get("batch_gen_running", False)
+        if not batch_running:
+            if st.button("Generate Batch", use_container_width=True):
+                st.session_state["batch_gen_running"] = True
+                st.session_state["batch_gen_cancel"] = False
+                st.rerun()
+        else:
+            if st.button("Cancel Batch", type="secondary", use_container_width=True):
+                st.session_state["batch_gen_cancel"] = True
 
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+    if st.session_state.get("batch_gen_running"):
+        scope_limit = 5 if "5" in batch_scope else (10 if "10" in batch_scope else len(df))
+        target_df = df.nlargest(scope_limit, "urgency")
 
-            for i, (_, row) in enumerate(target_df.iterrows()):
-                status_text.text(f"Generating {batch_template} for {row['name']}...")
-                generate_doc(row["path"], row["name"], row["id"], batch_template)
-                progress_bar.progress((i + 1) / len(target_df))
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        results_ok = 0
+        results_err = 0
 
-            status_text.text("Batch generation complete!")
-            st.success(f"Generated {len(target_df)} documents")
+        for i, (_, row) in enumerate(target_df.iterrows()):
+            if st.session_state.get("batch_gen_cancel"):
+                status_text.warning(f"Cancelled after {i} of {len(target_df)} documents")
+                break
+            status_text.text(f"[{i+1}/{len(target_df)}] Generating {batch_template} for {row['name']}...")
+            try:
+                result = generate_doc(row["path"], row["name"], row["id"], batch_template)
+                if result and result.status == "success":
+                    results_ok += 1
+                else:
+                    results_err += 1
+            except Exception:
+                results_err += 1
+            progress_bar.progress((i + 1) / len(target_df))
+        else:
+            status_text.success(f"Batch complete: {results_ok} succeeded, {results_err} failed")
+
+        st.session_state["batch_gen_running"] = False
+        st.session_state["batch_gen_cancel"] = False
 
     st.divider()
 
@@ -446,7 +492,7 @@ def render_docs_tab(df: pd.DataFrame):
                 ).order_by(DocGeneration.generated_at.desc()).first()
 
                 if latest and latest.generated_at:
-                    age_days = (datetime.utcnow() - latest.generated_at).days
+                    age_days = (_utcnow() - latest.generated_at).days
                     row_data[tid] = f"{age_days}d ago"
                 else:
                     tmpl = per_project_templates[tid]
@@ -494,8 +540,15 @@ def render_docs_tab(df: pd.DataFrame):
             doc_path = Path(proj_row["path"]) / tmpl.output_dir / tmpl.output_filename
 
             if doc_path.exists():
-                content = doc_path.read_text()
-                st.markdown(content)
+                file_size = doc_path.stat().st_size
+                if file_size > 50 * 1024:
+                    content = doc_path.read_text()
+                    st.warning(f"Document is large ({file_size // 1024} KB) — showing as plain text.")
+                    st.download_button("Download", content, file_name=doc_path.name, mime="text/markdown")
+                    st.code(content[:2000] + f"\n\n... [{file_size // 1024} KB total — download to view full document]", language="markdown")
+                else:
+                    content = doc_path.read_text()
+                    st.markdown(content)
             else:
                 st.info(f"No {tmpl.name} document found for {view_project}. Generate one above.")
 
@@ -511,7 +564,7 @@ def render_activity_tab():
     st.subheader("Activity Digest")
 
     # Date range controls
-    col1, col2, col3 = st.columns([1, 1, 2])
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
 
     default_start, default_end = week_to_date_range()
 
@@ -520,16 +573,31 @@ def render_activity_tab():
     with col2:
         end_date = st.date_input("End", value=default_end.date(), key="digest_end")
     with col3:
+        # Client filter: collect unique client names from DB
+        _act_session = get_session()
+        try:
+            from sqlalchemy import distinct
+            client_names = [
+                r[0] for r in _act_session.query(distinct(Project.client_name))
+                .filter(Project.client_name.isnot(None), Project.client_name != "")
+                .order_by(Project.client_name).all()
+            ]
+        finally:
+            _act_session.close()
+        filter_client = st.selectbox("Client", ["All"] + client_names, key="digest_client")
+    with col4:
         view_mode = st.radio("View", ["By Project/Client", "By Day"], horizontal=True, key="digest_mode")
 
     start_dt = datetime.combine(start_date, datetime.min.time())
     end_dt = datetime.combine(end_date, datetime.max.time())
     range_label = f"{start_dt.strftime('%b %d')} – {end_dt.strftime('%b %d, %Y')}"
 
+    client_filter = filter_client if filter_client != "All" else None
+
     session = get_session()
     try:
         if view_mode == "By Project/Client":
-            results = digest_by_project(session, start_dt, end_dt)
+            results = digest_by_project(session, start_dt, end_dt, client_filter=client_filter)
 
             if not results:
                 st.info(f"No activity found for {range_label}. Run `pm scan` to capture data.")
@@ -588,7 +656,7 @@ def load_stale_projects():
     """Load stale projects (inactive 30+ days, not archived, not someday)."""
     session = get_session()
     try:
-        threshold = datetime.utcnow() - timedelta(days=30)
+        threshold = _utcnow() - timedelta(days=30)
         projects = session.query(Project).filter(
             (Project.archived == False) | (Project.archived == None),
             Project.priority != 5,
@@ -597,7 +665,7 @@ def load_stale_projects():
 
         data = []
         for p in projects:
-            days_inactive = (datetime.utcnow() - p.last_activity).days if p.last_activity else None
+            days_inactive = (_utcnow() - p.last_activity).days if p.last_activity else None
             data.append({
                 "name": p.name,
                 "path": p.path,
@@ -623,7 +691,7 @@ def _stale_action_archive(project_id: str, reason: str):
         if project:
             project.archived = True
             if reason:
-                project.notes = f"{project.notes or ''}\n\n[Archived {datetime.utcnow().strftime('%Y-%m-%d')}] {reason}".strip()
+                project.notes = f"{project.notes or ''}\n\n[Archived {_utcnow().strftime('%Y-%m-%d')}] {reason}".strip()
             session.commit()
             _sync_project_to_file(project)
     finally:
@@ -648,7 +716,7 @@ def _stale_action_pivot(project_id: str, direction: str):
     try:
         project = session.query(Project).filter_by(id=project_id).first()
         if project:
-            project.notes = f"{project.notes or ''}\n\n[Pivot {datetime.utcnow().strftime('%Y-%m-%d')}] {direction}".strip()
+            project.notes = f"{project.notes or ''}\n\n[Pivot {_utcnow().strftime('%Y-%m-%d')}] {direction}".strip()
             session.commit()
             _sync_project_to_file(project)
     finally:
@@ -661,7 +729,7 @@ def _stale_action_combine(project_id: str, target_name: str):
         project = session.query(Project).filter_by(id=project_id).first()
         if project:
             project.archived = True
-            project.notes = f"{project.notes or ''}\n\n[Combined into {target_name} on {datetime.utcnow().strftime('%Y-%m-%d')}]".strip()
+            project.notes = f"{project.notes or ''}\n\n[Combined into {target_name} on {_utcnow().strftime('%Y-%m-%d')}]".strip()
             session.commit()
             _sync_project_to_file(project)
     finally:
@@ -674,7 +742,7 @@ def _stale_action_replace(project_id: str, replacement_name: str):
         project = session.query(Project).filter_by(id=project_id).first()
         if project:
             project.archived = True
-            project.notes = f"{project.notes or ''}\n\n[Replaced by {replacement_name} on {datetime.utcnow().strftime('%Y-%m-%d')}]".strip()
+            project.notes = f"{project.notes or ''}\n\n[Replaced by {replacement_name} on {_utcnow().strftime('%Y-%m-%d')}]".strip()
             session.commit()
             _sync_project_to_file(project)
     finally:
@@ -743,7 +811,7 @@ def render_stale_tab(all_project_names: list[str]):
                     _stale_action_archive(proj["id"], reason)
                     st.success(f"Archived {proj['name']}")
                     del st.session_state[f"stale_action_{i}"]
-                    st.cache_data.clear()
+                    _bump_cache()
                     st.rerun()
 
             elif action == "forward":
@@ -753,7 +821,7 @@ def render_stale_tab(all_project_names: list[str]):
                     _stale_action_forward(proj["id"], na, pri)
                     st.success(f"Updated {proj['name']}")
                     del st.session_state[f"stale_action_{i}"]
-                    st.cache_data.clear()
+                    _bump_cache()
                     st.rerun()
 
             elif action == "pivot":
@@ -762,7 +830,7 @@ def render_stale_tab(all_project_names: list[str]):
                     _stale_action_pivot(proj["id"], direction)
                     st.success(f"Updated {proj['name']}")
                     del st.session_state[f"stale_action_{i}"]
-                    st.cache_data.clear()
+                    _bump_cache()
                     st.rerun()
 
             elif action == "combine":
@@ -772,7 +840,7 @@ def render_stale_tab(all_project_names: list[str]):
                     _stale_action_combine(proj["id"], target)
                     st.success(f"Archived {proj['name']}, combined into {target}")
                     del st.session_state[f"stale_action_{i}"]
-                    st.cache_data.clear()
+                    _bump_cache()
                     st.rerun()
 
             elif action == "replace":
@@ -782,7 +850,7 @@ def render_stale_tab(all_project_names: list[str]):
                     _stale_action_replace(proj["id"], repl)
                     st.success(f"Archived {proj['name']}, replaced by {repl}")
                     del st.session_state[f"stale_action_{i}"]
-                    st.cache_data.clear()
+                    _bump_cache()
                     st.rerun()
 
 
@@ -951,15 +1019,21 @@ def render_projects_tab(df: pd.DataFrame):
         sort_col, sort_asc = sort_options[sort_choice]
 
     with ctrl2:
-        filter_cat = st.selectbox("Category", ["All"] + sorted(df["category"].unique().tolist()), label_visibility="collapsed")
+        _prev_cat = st.session_state.get("_sel_cat", "All")
+        cat_label = "Category" if _prev_cat == "All" else f"Category ▶ {_prev_cat}"
+        filter_cat = st.selectbox(cat_label, ["All"] + sorted(df["category"].unique().tolist()), key="_sel_cat")
 
     with ctrl3:
-        filter_type = st.selectbox("Filter", ["All", "Dirty", "Decisions", "Overdue"], label_visibility="collapsed")
+        _prev_type = st.session_state.get("_sel_type", "All")
+        type_label = "Filter" if _prev_type == "All" else f"Filter ▶ {_prev_type}"
+        filter_type = st.selectbox(type_label, ["All", "Dirty", "Decisions", "Overdue"], key="_sel_type")
 
     with ctrl4:
         # Tag filter
         all_tags = sorted(set(tag for tags in df["tags"] for tag in tags))
-        filter_tags = st.multiselect("Tags", all_tags, label_visibility="collapsed", placeholder="Tags...")
+        _prev_tags = st.session_state.get("_sel_tags", [])
+        tags_label = "Tags" if not _prev_tags else f"Tags ({len(_prev_tags)} active)"
+        filter_tags = st.multiselect(tags_label, all_tags, key="_sel_tags", placeholder="Tags...")
 
     with ctrl5:
         bcol1, bcol2, bcol3 = st.columns(3)
@@ -1000,12 +1074,18 @@ def render_projects_tab(df: pd.DataFrame):
                         selected_ids.append(r["id"])
                 _bulk_apply_tag(selected_ids, bulk_tag)
                 st.session_state.selected = set()
-                st.cache_data.clear()
+                _bump_cache()
                 st.rerun()
         with btcol4:
             if st.button("Clear", use_container_width=True):
                 st.session_state.selected = set()
                 st.rerun()
+
+    # Reset page when filters change (TD-023)
+    current_filters = {"cat": filter_cat, "type": filter_type, "tags": tuple(sorted(filter_tags))}
+    if current_filters != st.session_state._prev_filters:
+        st.session_state.page = 0
+        st.session_state._prev_filters = current_filters
 
     # Apply filters
     filtered_df = df.copy()
@@ -1048,14 +1128,21 @@ def render_projects_tab(df: pd.DataFrame):
 
     # Column headers
     hdr0, hdr1, hdr2, hdr3, hdr4, hdr5, hdr6, hdr7 = st.columns([0.3, 0.5, 2.5, 0.8, 0.8, 1, 1, 1.2])
-    hdr0.markdown("**Sel**")
-    hdr1.markdown("**St**")
+    # "Select All" checkbox in header — selects/deselects all visible projects on current page
+    page_names = set(page_df["name"].tolist())
+    all_selected = page_names and page_names.issubset(st.session_state.selected)
+    if hdr0.checkbox("", value=all_selected, key="sel_all", help="Select all on page", label_visibility="collapsed"):
+        st.session_state.selected.update(page_names)
+    else:
+        st.session_state.selected.difference_update(page_names)
+    hdr1.markdown("**Flags**")
     hdr2.markdown("**Project**")
     hdr3.markdown("**Health**")
     hdr4.markdown("**Done**")
     hdr5.markdown("**Last Activity**")
     hdr6.markdown("**Last Commit**")
     hdr7.markdown("**Actions**")
+    st.caption("Flags: 🔴 Critical · 🟠 High · ⚪ Normal · 🔵 Low · ● Dirty · ⚠️ Decision · ⏰ Overdue")
     st.divider()
 
     # Collect all tags once for editing dropdowns
@@ -1114,13 +1201,27 @@ def render_projects_tab(df: pd.DataFrame):
                     dl_val = row["deadline"].date() if row["deadline"] is not None and not (isinstance(row["deadline"], float) and pd.isna(row["deadline"])) else None
                     new_deadline = st.date_input("Deadline", value=dl_val, key=f"dl_{idx}")
                 with mcol3:
-                    tgt_val = None
-                    new_notes = st.text_area("Notes", value=row["notes"], key=f"notes_{idx}", height=80)
+                    tgt_raw = row.get("target_date")
+                    tgt_val = tgt_raw.date() if tgt_raw is not None and not (isinstance(tgt_raw, float) and pd.isna(tgt_raw)) else None
+                    new_target = st.date_input("Target Date", value=tgt_val, key=f"tgt_{idx}")
+
+                hcol1, hcol2 = st.columns(2)
+                with hcol1:
+                    budget_raw = row.get("budget_hours")
+                    budget_val = float(budget_raw) if budget_raw and not pd.isna(budget_raw) else 0.0
+                    new_budget = st.number_input("Budget (hrs)", min_value=0.0, step=0.5, value=budget_val, key=f"bud_{idx}")
+                with hcol2:
+                    logged_raw = row.get("hours_logged", 0.0)
+                    logged_val = float(logged_raw) if logged_raw and not pd.isna(logged_raw) else 0.0
+                    new_logged = st.number_input("Logged (hrs)", min_value=0.0, step=0.5, value=logged_val, key=f"log_{idx}")
+
+                new_notes = st.text_area("Notes", value=row["notes"], key=f"notes_{idx}", height=80)
 
                 if st.button("Save", key=f"savemeta_{idx}", use_container_width=True):
-                    _save_metadata(row["id"], new_priority, new_deadline, None, new_notes)
+                    _save_metadata(row["id"], new_priority, new_deadline, new_target, new_notes,
+                                   budget_hours=new_budget, hours_logged=new_logged)
                     st.session_state.last_expanded_id = row["id"]
-                    st.cache_data.clear()
+                    _bump_cache()
                     st.rerun()
 
                 # ── Inline tag editing ──────────────────────────────────────
@@ -1142,7 +1243,7 @@ def render_projects_tab(df: pd.DataFrame):
                             save_list.append(new_tag_input)
                         _save_tags(row["id"], row["path"], save_list)
                         st.session_state.last_expanded_id = row["id"]
-                        st.cache_data.clear()
+                        _bump_cache()
                         st.rerun()
 
                 # ── Run prompt ──────────────────────────────────────────────
@@ -1200,11 +1301,22 @@ def render_projects_tab(df: pd.DataFrame):
         with col7:
             ac1, ac2, ac3 = st.columns(3)
             if ac1.button("🚀", key=f"l_{idx}", help="Launch Claude"):
-                launch_claude(row["path"], row["name"])
+                try:
+                    launch_claude(row["path"], row["name"])
+                    st.toast(f"Launched {row['name']}", icon="🚀")
+                except Exception as e:
+                    st.toast(f"Launch failed: {e}", icon="❌")
             if ac2.button("📂", key=f"v_{idx}", help="VSCode"):
-                subprocess.Popen(["code", row["path"]])
+                try:
+                    subprocess.Popen(["code", row["path"]])
+                    st.toast(f"Opened {row['name']} in VSCode", icon="📂")
+                except Exception as e:
+                    st.toast(f"VSCode failed: {e}", icon="❌")
             if ac3.button("📁", key=f"f_{idx}", help="Finder"):
-                subprocess.Popen(["open", row["path"]])
+                try:
+                    subprocess.Popen(["open", row["path"]])
+                except Exception as e:
+                    st.toast(f"Finder failed: {e}", icon="❌")
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -1213,9 +1325,9 @@ def render_projects_tab(df: pd.DataFrame):
 def main():
     st.title("📊 Project Manager")
 
-    # Load data
+    # Load data (cache_version key invalidates cache on mutations)
     with st.spinner("Loading projects..."):
-        df = load_projects()
+        df = load_projects(st.session_state.get("cache_version", 0))
 
     if df.empty:
         st.error("No projects found. Run `pm scan ~/dev2` first.")

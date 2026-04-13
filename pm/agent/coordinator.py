@@ -12,7 +12,7 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -30,7 +30,7 @@ DEFAULT_PROJECT_BUDGET = 1.00
 @dataclass
 class CoordinatorResult:
     """Summary of a coordinator run across multiple projects."""
-    started_at: datetime = field(default_factory=datetime.utcnow)
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
     completed_at: Optional[datetime] = None
     assessments: list[AssessmentResult] = field(default_factory=list)
     executions: list[RunResult] = field(default_factory=list)
@@ -129,7 +129,7 @@ class AgentCoordinator:
                         "error": str(e),
                     })
 
-        coord_result.completed_at = datetime.utcnow()
+        coord_result.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
         return coord_result
 
     def _assess_and_act(

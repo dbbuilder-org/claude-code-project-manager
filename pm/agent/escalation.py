@@ -19,7 +19,7 @@ from __future__ import annotations
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from .planner import AssessmentResult
@@ -89,7 +89,7 @@ def send_escalation(
 
     sent = _send_imessage(phone, message)
     if sent:
-        result.sent_at = datetime.utcnow()
+        result.sent_at = datetime.now(timezone.utc).replace(tzinfo=None)
     else:
         result.decision = "error"
         result.error = "Failed to send iMessage"
@@ -112,10 +112,10 @@ def wait_for_reply(
 
     deadline = result.sent_at + timedelta(minutes=timeout_mins)
 
-    while datetime.utcnow() < deadline:
+    while datetime.now(timezone.utc).replace(tzinfo=None) < deadline:
         reply = _poll_for_reply(phone, after=result.sent_at)
         if reply:
-            result.replied_at = datetime.utcnow()
+            result.replied_at = datetime.now(timezone.utc).replace(tzinfo=None)
             reply_clean = reply.strip().lower()
 
             if reply_clean == "1":
