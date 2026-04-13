@@ -30,6 +30,7 @@ from .terminal import (
     launch_batch as terminal_launch_batch,
     build_command as terminal_build_command,
     is_shutdown_supported,
+    _escape_applescript,
 )
 
 
@@ -2992,15 +2993,14 @@ def triage(limit: int, imessage: bool, dry_run: bool, timeout: int):
 
 def _send_imessage_triage(message: str, phone: str = "+12064962555") -> None:
     """Send a triage recommendation via iMessage."""
-    import subprocess as _sp
-    script = f'''
-tell application "Messages"
-    set targetBuddy to "{phone}"
+    escaped_msg = _escape_applescript(message)
+    escaped_phone = _escape_applescript(phone)
+    script = f'''tell application "Messages"
+    set targetBuddy to "{escaped_phone}"
     set targetService to (1st account whose service type = iMessage)
     set targetBuddy to participant targetBuddy of targetService
-    send "{message}" to targetBuddy
-end tell
-'''
+    send "{escaped_msg}" to targetBuddy
+end tell'''
     subprocess.run(["osascript", "-e", script], check=True, capture_output=True)
 
 
