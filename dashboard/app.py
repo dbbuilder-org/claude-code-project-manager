@@ -600,7 +600,11 @@ def render_activity_tab():
             results = digest_by_project(session, start_dt, end_dt, client_filter=client_filter)
 
             if not results:
-                st.info(f"No activity found for {range_label}. Run `pm scan` to capture data.")
+                st.info(f"No activity found for {range_label}.")
+                if st.button("Scan Now", key="scan_now_project"):
+                    import subprocess as _sp
+                    _sp.Popen(["pm", "scan", str(Path.home() / "dev2")])
+                    st.success("Scan started — refresh in a moment.")
                 return
 
             st.caption(f"{len(results)} projects with activity — {range_label}")
@@ -628,7 +632,11 @@ def render_activity_tab():
             results = digest_by_day(session, start_dt, end_dt)
 
             if not results:
-                st.info(f"No activity found for {range_label}. Run `pm scan` to capture data.")
+                st.info(f"No activity found for {range_label}.")
+                if st.button("Scan Now", key="scan_now_day"):
+                    import subprocess as _sp
+                    _sp.Popen(["pm", "scan", str(Path.home() / "dev2")])
+                    st.success("Scan started — refresh in a moment.")
                 return
 
             total_unique = len(set(n for r in results for n in r["project_names"]))
@@ -836,7 +844,8 @@ def render_stale_tab(all_project_names: list[str]):
             elif action == "combine":
                 targets = [n for n in all_project_names if n != proj["name"]]
                 target = st.selectbox("Combine into", targets, key=f"ct_{i}")
-                if st.button("Confirm Combine", key=f"cc_{i}"):
+                st.warning(f"This will archive **{proj['name']}** and merge its context into **{target}**.")
+                if st.button("Confirm Combine", key=f"cc_{i}", type="primary"):
                     _stale_action_combine(proj["id"], target)
                     st.success(f"Archived {proj['name']}, combined into {target}")
                     del st.session_state[f"stale_action_{i}"]
@@ -846,7 +855,8 @@ def render_stale_tab(all_project_names: list[str]):
             elif action == "replace":
                 targets = [n for n in all_project_names if n != proj["name"]]
                 repl = st.selectbox("Replacement project", targets, key=f"rt_{i}")
-                if st.button("Confirm Replace", key=f"cr_{i}"):
+                st.warning(f"This will archive **{proj['name']}** as superseded by **{repl}**.")
+                if st.button("Confirm Replace", key=f"cr_{i}", type="primary"):
                     _stale_action_replace(proj["id"], repl)
                     st.success(f"Archived {proj['name']}, replaced by {repl}")
                     del st.session_state[f"stale_action_{i}"]
@@ -1112,13 +1122,13 @@ def render_projects_tab(df: pd.DataFrame):
     if total_pages > 1:
         pcol1, pcol2, pcol3 = st.columns([1, 2, 1])
         with pcol1:
-            if st.button("← Prev") and st.session_state.page > 0:
+            if st.button("← Prev", disabled=st.session_state.page == 0):
                 st.session_state.page -= 1
                 st.rerun()
         with pcol2:
-            st.markdown(f"<center>Page {st.session_state.page + 1} of {total_pages}</center>", unsafe_allow_html=True)
+            st.caption(f"Page {st.session_state.page + 1} of {total_pages}")
         with pcol3:
-            if st.button("Next →") and st.session_state.page < total_pages - 1:
+            if st.button("Next →", disabled=st.session_state.page >= total_pages - 1):
                 st.session_state.page += 1
                 st.rerun()
 
