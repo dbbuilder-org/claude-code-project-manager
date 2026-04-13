@@ -1,5 +1,6 @@
 """SQLAlchemy models for project tracking."""
 
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -7,6 +8,15 @@ from sqlalchemy import create_engine, Column, String, Float, Boolean, DateTime, 
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
 
 Base = declarative_base()
+
+# Canonical priority label mapping — import this instead of redefining locally
+PRIORITY_LABELS: dict[int, str] = {
+    1: "Critical",
+    2: "High",
+    3: "Normal",
+    4: "Low",
+    5: "Someday",
+}
 
 
 class Project(Base):
@@ -57,6 +67,7 @@ class Project(Base):
     # Relationships
     items = relationship("ProgressItem", back_populates="project", cascade="all, delete-orphan")
     history = relationship("ScanHistory", back_populates="project", cascade="all, delete-orphan")
+    doc_generations = relationship("DocGeneration", back_populates="project", cascade="all, delete-orphan")
 
     @property
     def days_until_deadline(self) -> Optional[int]:
@@ -168,8 +179,7 @@ class Project(Base):
     @property
     def priority_label(self) -> str:
         """Human-readable priority label."""
-        labels = {1: "Critical", 2: "High", 3: "Normal", 4: "Low", 5: "Someday"}
-        return labels.get(self.priority, "Normal")
+        return PRIORITY_LABELS.get(self.priority, "Normal")
 
     @property
     def tags_list(self) -> list[str]:
@@ -178,9 +188,45 @@ class Project(Base):
             import json
             try:
                 return json.loads(self.tags)
-            except:
+            except json.JSONDecodeError:
                 return []
         return []
+
+    def add_tag(self, tag: str) -> None:
+        """Add a tag (no-op if already present)."""
+        import json
+        tags = self.tags_list
+        if tag not in tags:
+            tags.append(tag)
+            self.tags = json.dumps(tags)
+
+    def remove_tag(self, tag: str) -> None:
+        """Remove a tag (no-op if not present)."""
+        import json
+        tags = self.tags_list
+        if tag in tags:
+            tags.remove(tag)
+            self.tags = json.dumps(tags)
+
+    @staticmethod
+    def all_tags(session) -> list[str]:
+        """Get all unique tags across all projects, sorted."""
+        projects = session.query(Project).filter(Project.tags.isnot(None)).all()
+        all_t = set()
+        for p in projects:
+            all_t.update(p.tags_list)
+        return sorted(all_t)
+
+    @property
+    def is_stale(self) -> bool:
+        """Check if project is stale (inactive 30+ days, not archived, not someday)."""
+        if self.archived:
+            return False
+        if self.priority == 5:
+            return False
+        if self.last_activity is None:
+            return True
+        return (datetime.utcnow() - self.last_activity).days >= 30
 
 
 class ProgressItem(Base):
@@ -217,20 +263,62 @@ class ScanHistory(Base):
     project = relationship("Project", back_populates="history")
 
 
+class DocGeneration(Base):
+    """Record of a document generation run."""
+    __tablename__ = "doc_generations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    project_id = Column(String, ForeignKey("projects.id"), nullable=False)
+    template_id = Column(String, nullable=False)  # "roadmap", "architecture", etc.
+    output_path = Column(String)  # Relative path from project root
+    generated_at = Column(DateTime, default=datetime.utcnow)
+    duration_secs = Column(Float)
+    status = Column(String)  # "success", "error", "timeout"
+    error_message = Column(Text)
+    file_size_bytes = Column(Integer)
+
+    project = relationship("Project", back_populates="doc_generations")
+
+
+class AgentRun(Base):
+    """Record of an agent assess/execute/escalate run."""
+    __tablename__ = "agent_runs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    project_id = Column(String, ForeignKey("projects.id"), nullable=False)
+
+    # Timing
+    started_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime)
+    duration_secs = Column(Float)
+
+    # Assess phase
+    confidence = Column(Integer)               # 0-100
+    proposed_action = Column(Text)
+    proposed_prompt = Column(Text)
+    reasoning = Column(Text)
+    risk_level = Column(String)                # "safe", "moderate", "risky"
+    assess_duration_secs = Column(Float)
+
+    # Execute phase
+    status = Column(String)                    # "auto_executed", "escalated", "dry_run", "error"
+    output = Column(Text)
+    error_message = Column(Text)
+    cost_usd = Column(Float)                   # Estimated cost of this run in USD
+
+    project = relationship("Project", backref="agent_runs")
+
+
 # Database connection
+import threading as _threading
 _engine = None
 _SessionLocal = None
+_db_lock = _threading.Lock()
 
 
-def _migrate_db(engine) -> None:
-    """Add missing columns to existing tables."""
-    from sqlalchemy import inspect, text
-
-    inspector = inspect(engine)
-    existing_columns = {c['name'] for c in inspector.get_columns('projects')}
-
-    # New columns to add with their SQLite types
-    new_columns = [
+# Migration registry: (version, description, list of (col_name, sql_type))
+_MIGRATIONS = [
+    (1, "PM metadata columns", [
         ("notes", "TEXT"),
         ("deadline", "DATETIME"),
         ("target_date", "DATETIME"),
@@ -240,31 +328,104 @@ def _migrate_db(engine) -> None:
         ("budget_hours", "FLOAT"),
         ("hours_logged", "FLOAT DEFAULT 0"),
         ("archived", "BOOLEAN DEFAULT 0"),
-    ]
+    ]),
+    (2, "AgentRun cost tracking", []),  # New column added via table create; alter handled below
+]
+
+# Column additions outside of 'projects' table (table_name, col_name, sql_type)
+_TABLE_MIGRATIONS = [
+    (2, "agent_runs", "cost_usd", "FLOAT"),
+]
+
+
+def _migrate_db(engine) -> None:
+    """Run schema migrations transactionally; skip already-applied versions."""
+    from sqlalchemy import inspect, text
 
     with engine.connect() as conn:
-        for col_name, col_type in new_columns:
-            if col_name not in existing_columns:
-                try:
-                    conn.execute(text(f"ALTER TABLE projects ADD COLUMN {col_name} {col_type}"))
-                    conn.commit()
-                except Exception:
-                    pass  # Column might already exist
+        # Ensure migration tracking table exists
+        conn.execute(text(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        ))
+        conn.commit()
+
+        # Create new tables if needed (idempotent via checkfirst)
+        inspector = inspect(engine)
+        existing_tables = inspector.get_table_names()
+        if "doc_generations" not in existing_tables:
+            DocGeneration.__table__.create(engine, checkfirst=True)
+        if "agent_runs" not in existing_tables:
+            AgentRun.__table__.create(engine, checkfirst=True)
+
+        for version, description, columns in _MIGRATIONS:
+            row = conn.execute(
+                text("SELECT version FROM schema_migrations WHERE version = :v"),
+                {"v": version}
+            ).fetchone()
+            if row is not None:
+                continue  # Already applied
+
+            try:
+                # Projects-table ALTER TABLEs
+                if columns:
+                    existing_columns = {
+                        c['name'] for c in inspect(engine).get_columns('projects')
+                    }
+                    for col_name, col_type in columns:
+                        if col_name not in existing_columns:
+                            conn.execute(text(
+                                f"ALTER TABLE projects ADD COLUMN {col_name} {col_type}"
+                            ))
+
+                # Other-table ALTER TABLEs for this version
+                for mig_version, table_name, col_name, col_type in _TABLE_MIGRATIONS:
+                    if mig_version != version:
+                        continue
+                    existing_tables = inspect(engine).get_table_names()
+                    if table_name not in existing_tables:
+                        continue
+                    existing_cols = {
+                        c['name'] for c in inspect(engine).get_columns(table_name)
+                    }
+                    if col_name not in existing_cols:
+                        conn.execute(text(
+                            f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"
+                        ))
+
+                conn.execute(
+                    text("INSERT INTO schema_migrations (version, applied_at) VALUES (:v, :ts)"),
+                    {"v": version, "ts": datetime.utcnow().isoformat()}
+                )
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                if "duplicate column name" not in str(e).lower():
+                    raise
 
 
 def init_db(db_path: Optional[Path] = None) -> None:
-    """Initialize the database."""
+    """Initialize the database (thread-safe, idempotent)."""
     global _engine, _SessionLocal
 
-    if db_path is None:
-        db_path = Path(__file__).parent.parent.parent / "data" / "projects.db"
+    with _db_lock:
+        # Already initialized — skip unless a different path is requested
+        if _engine is not None and db_path is None:
+            return
 
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+        if db_path is None:
+            env_path = os.environ.get("PM_DB_PATH")
+            if env_path:
+                db_path = Path(env_path).expanduser()
+            else:
+                db_path = Path.home() / ".pm" / "projects.db"
 
-    _engine = create_engine(f"sqlite:///{db_path}", echo=False)
-    Base.metadata.create_all(_engine)
-    _migrate_db(_engine)  # Add missing columns
-    _SessionLocal = sessionmaker(bind=_engine)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        _engine = create_engine(f"sqlite:///{db_path}", echo=False)
+        Base.metadata.create_all(_engine)
+        _migrate_db(_engine)  # Add missing columns
+        _SessionLocal = sessionmaker(bind=_engine)
 
 
 def get_session() -> Session:

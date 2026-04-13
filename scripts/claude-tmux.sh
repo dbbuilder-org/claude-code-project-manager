@@ -54,7 +54,7 @@ new_session() {
 
     # Create session
     tmux new-session -d -s "$session_name" -c "$project_path"
-    tmux send-keys -t "$session_name" "claude --resume" Enter
+    tmux send-keys -t "$session_name" "claude --resume --channels plugin:imessage@claude-plugins-official" Enter
 
     # Rename window
     tmux rename-window -t "$session_name" "$project"
@@ -83,7 +83,7 @@ add_to_session() {
 
     # Create new window
     tmux new-window -t "$session_name" -n "$project" -c "$project_path"
-    tmux send-keys -t "$session_name:$project" "claude --resume" Enter
+    tmux send-keys -t "$session_name:$project" "claude --resume --channels plugin:imessage@claude-plugins-official" Enter
 
     echo -e "${GREEN}Added.${NC} Window created for $project"
 }
@@ -153,14 +153,14 @@ setup_multi() {
     local first_path="$DEV2_DIR/$first"
 
     tmux new-session -d -s "$session_name" -c "$first_path" -n "$first"
-    tmux send-keys -t "$session_name:$first" "claude --resume" Enter
+    tmux send-keys -t "$session_name:$first" "claude --resume --channels plugin:imessage@claude-plugins-official" Enter
 
     # Add remaining projects
     for project in "${projects[@]:1}"; do
         local project_path="$DEV2_DIR/$project"
         if [ -d "$project_path" ]; then
             tmux new-window -t "$session_name" -n "$project" -c "$project_path"
-            tmux send-keys -t "$session_name:$project" "claude --resume" Enter
+            tmux send-keys -t "$session_name:$project" "claude --resume --channels plugin:imessage@claude-plugins-official" Enter
             sleep 0.5
         else
             echo -e "${YELLOW}Skipping (not found):${NC} $project"

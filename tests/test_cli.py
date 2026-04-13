@@ -268,14 +268,14 @@ class TestContinueCommand:
 
 
 class TestLaunchCommand:
-    """Tests for the 'pm launch' command."""
+    """Tests for the 'pm launch' command (second launch: N/name target)."""
 
-    def test_launch_no_args_shows_help(self, cli_runner, populated_db):
-        """Test launch without args shows help message."""
-        result = cli_runner.invoke(main, ["launch"])
+    def test_launch_default_launches_10(self, cli_runner, populated_db):
+        """Test launch without args defaults to 10 most recent."""
+        result = cli_runner.invoke(main, ["launch", "--dry-run"])
 
         assert result.exit_code == 0
-        assert "Specify project name" in result.output or "Examples" in result.output
+        assert "Dry run" in result.output or "Launching" in result.output
 
     def test_launch_dry_run(self, cli_runner, populated_db):
         """Test launch with dry-run flag."""
@@ -285,29 +285,25 @@ class TestLaunchCommand:
         # Either shows dry run message or project not found
         assert "Dry run" in result.output or "not found" in result.output.lower() or "No projects" in result.output
 
-    def test_launch_with_filter(self, cli_runner, populated_db):
-        """Test launch with filter."""
-        result = cli_runner.invoke(main, ["launch", "--dry-run", "--filter", "type:client"])
+    def test_launch_by_count(self, cli_runner, populated_db):
+        """Test launch with a number to limit results."""
+        result = cli_runner.invoke(main, ["launch", "--dry-run", "5"])
 
         assert result.exit_code == 0
-        # Command runs successfully
+        assert "Dry run" in result.output or "Launching" in result.output
 
-    def test_launch_multiple_projects(self, cli_runner, populated_db):
-        """Test launching multiple projects."""
-        result = cli_runner.invoke(
-            main,
-            ["launch", "--dry-run", "alpha", "tool"]
-        )
+    def test_launch_dirty_only(self, cli_runner, populated_db):
+        """Test launch with --dirty-only flag."""
+        result = cli_runner.invoke(main, ["launch", "--dry-run", "-d"])
 
         assert result.exit_code == 0
-        # Command should complete
 
-    def test_launch_shows_health_scores(self, cli_runner, populated_db):
-        """Test launch shows health scores in preview."""
-        result = cli_runner.invoke(main, ["launch", "--dry-run", "--filter", "type:client"])
+    def test_launch_terminal_flag(self, cli_runner, populated_db):
+        """Test launch with --terminal flag."""
+        result = cli_runner.invoke(main, ["launch", "--dry-run", "--terminal"])
 
         assert result.exit_code == 0
-        # Either shows health column or no projects message
+        assert "terminal" in result.output.lower()
 
 
 class TestDashboardCommand:
@@ -356,7 +352,8 @@ class TestCommandHelp:
         result = cli_runner.invoke(main, ["launch", "--help"])
 
         assert result.exit_code == 0
-        assert "parallel" in result.output.lower()
+        assert "terminal" in result.output.lower()
+        assert "dry-run" in result.output.lower()
 
 
 class TestVersion:

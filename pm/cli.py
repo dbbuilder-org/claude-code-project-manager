@@ -1,9 +1,12 @@
 """CLI interface for project manager."""
 
 import json
+import re
 import subprocess
+import threading
+import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from typing import Optional
 
 import click
@@ -17,10 +20,61 @@ from .scanner.detector import ProjectDetector, ProjectInfo
 from .scanner.parser import ProgressParser, ProjectProgress, ItemStatus
 from .generator.prompts import ContinuePromptGenerator, PromptMode
 from .database.models import init_db, get_session, Project, ProgressItem, ScanHistory
-from .metadata import read_pm_status, sync_to_file, PM_STATUS_FILENAME
+from .metadata import read_pm_status, sync_to_file, sync_project_to_file, PM_STATUS_FILENAME
+from .digest import week_to_date_range, digest_by_project, digest_by_day
+from .brief import build_brief, format_brief_text, format_brief_imessage
+from .terminal import (
+    TerminalApp,
+    detect_terminal,
+    launch_single as terminal_launch_single,
+    launch_batch as terminal_launch_batch,
+    build_command as terminal_build_command,
+    is_shutdown_supported,
+)
 
 
 console = Console()
+
+
+def apply_project_filter(query, filter_str: Optional[str]):
+    """Apply a filter string to a SQLAlchemy Project query.
+
+    Supported filters:
+        type:<category>    e.g. type:client
+        priority:<1-5>     e.g. priority:1
+        overdue            projects past their deadline
+        tagged:<tag>       projects with a specific tag
+        status:active      completion < 100
+        status:complete    completion >= 100
+    """
+    if not filter_str:
+        return query
+
+    from .database.models import Project as _Project
+    from datetime import datetime as _dt
+
+    if filter_str.startswith("type:"):
+        category = filter_str.split(":", 1)[1]
+        query = query.filter(_Project.category == category)
+    elif filter_str.startswith("priority:"):
+        try:
+            p = int(filter_str.split(":", 1)[1])
+            query = query.filter(_Project.priority == p)
+        except ValueError:
+            pass
+    elif filter_str == "overdue":
+        query = query.filter(_Project.deadline < _dt.utcnow())
+    elif filter_str.startswith("tagged:"):
+        tag = filter_str.split(":", 1)[1]
+        query = query.filter(_Project.tags.ilike(f"%{tag}%"))
+    elif filter_str.startswith("status:"):
+        s = filter_str.split(":", 1)[1]
+        if s == "active":
+            query = query.filter(_Project.completion_pct < 100)
+        elif s == "complete":
+            query = query.filter(_Project.completion_pct >= 100)
+
+    return query
 
 
 @click.group()
@@ -184,17 +238,7 @@ def status(filter_str: Optional[str], sort: str, limit: int, as_json: bool):
     # Build query
     query = session.query(Project)
 
-    # Apply filters
-    if filter_str:
-        if filter_str.startswith("type:"):
-            category = filter_str.split(":")[1]
-            query = query.filter(Project.category == category)
-        elif filter_str.startswith("status:"):
-            status = filter_str.split(":")[1]
-            if status == "active":
-                query = query.filter(Project.completion_pct < 100)
-            elif status == "complete":
-                query = query.filter(Project.completion_pct >= 100)
+    query = apply_project_filter(query, filter_str)
 
     # Apply sort
     if sort == "completion":
@@ -370,182 +414,14 @@ def continue_project(
                 except Exception:
                     pass
 
-            # Open in new terminal
-            cmd = f"""osascript -e 'tell application "Terminal" to do script "{prompt.command}"'"""
-            subprocess.run(cmd, shell=True)
-            console.print(f"[green]✓[/green] Launched terminal for {proj.name}")
+            # Open in terminal (iTerm2 or Terminal.app)
+            used = terminal_launch_single(
+                str(project_path), proj.name, prompt.command
+            )
+            console.print(f"[green]✓[/green] Launched {used.value} for {proj.name}")
 
     session.close()
 
-
-@main.command()
-@click.argument("project_names", nargs=-1)
-@click.option("--filter", "-f", "filter_str", help="Filter projects: type:client, type:internal")
-@click.option("--parallel", "-p", default=1, help="Number of projects to launch in parallel")
-@click.option("--mode", "-m", default="context", type=click.Choice(["simple", "context", "decision"]))
-@click.option("--dry-run", is_flag=True, help="Show what would be launched without executing")
-@click.option("--iterm", is_flag=True, default=True, help="Use iTerm2 (default: true)")
-@click.option("--tmux", is_flag=True, help="Use tmux instead of separate windows")
-def launch(
-    project_names: tuple,
-    filter_str: Optional[str],
-    parallel: int,
-    mode: str,
-    dry_run: bool,
-    iterm: bool,
-    tmux: bool,
-):
-    """Launch Claude Code for one or more projects.
-
-    Examples:
-        pm launch remoteC                    # Launch single project
-        pm launch remoteC anterix github-spec # Launch multiple
-        pm launch --filter type:client -p 3  # Launch clients in parallel
-        pm launch --filter type:client --tmux # Use tmux session
-    """
-    init_db()
-    session = get_session()
-    parser = ProgressParser()
-    generator = ContinuePromptGenerator()
-    prompt_mode = PromptMode(mode)
-
-    # Find projects
-    if project_names:
-        projects = []
-        for name in project_names:
-            proj = session.query(Project).filter(
-                Project.name.ilike(f"%{name}%")
-            ).first()
-            if proj:
-                projects.append(proj)
-            else:
-                console.print(f"[yellow]Warning:[/yellow] Project not found: {name}")
-    elif filter_str:
-        query = session.query(Project)
-        if filter_str.startswith("type:"):
-            category = filter_str.split(":")[1]
-            query = query.filter(Project.category == category)
-            projects = query.all()
-        elif filter_str.startswith("health:"):
-            threshold = filter_str.split(":")[1]
-            all_projects = query.all()
-            if threshold == "low":
-                projects = [p for p in all_projects if p.health_score < 40]
-            elif threshold == "attention":
-                projects = [p for p in all_projects if p.health_score < 70]
-            else:
-                projects = all_projects
-        else:
-            projects = query.all()
-    else:
-        console.print("[yellow]Specify project name(s) or --filter[/yellow]")
-        console.print("Examples:")
-        console.print("  pm launch remoteC")
-        console.print("  pm launch --filter type:client")
-        console.print("  pm launch --filter health:low")
-        session.close()
-        return
-
-    if not projects:
-        console.print("[red]No projects found[/red]")
-        session.close()
-        return
-
-    console.print(f"[bold blue]Launching {len(projects)} project(s)[/bold blue]")
-
-    # Show what will be launched
-    table = Table(box=box.SIMPLE, show_header=True, header_style="bold")
-    table.add_column("Project")
-    table.add_column("Health")
-    table.add_column("Phase")
-
-    for p in projects:
-        health = p.health_score
-        health_color = "green" if health >= 70 else ("yellow" if health >= 40 else "red")
-        table.add_row(
-            p.name,
-            f"[{health_color}]{health}[/{health_color}]",
-            p.current_phase or p.current_status or "—",
-        )
-
-    console.print(table)
-
-    if dry_run:
-        console.print("\n[dim]Dry run - no terminals launched[/dim]")
-        session.close()
-        return
-
-    # Check for claudecoderun
-    claudecoderun_path = Path.home() / "dev2" / "claudecoderun"
-    use_claudecoderun = claudecoderun_path.exists()
-
-    # Generate context files and launch
-    temp_dir = Path("/tmp/pm_launch")
-    temp_dir.mkdir(exist_ok=True)
-
-    launched = 0
-    for i, proj in enumerate(projects):
-        project_path = Path(proj.path)
-        progress = parser.parse_project(project_path)
-        prompt = generator.generate(project_path, proj.name, progress, prompt_mode)
-
-        # Create temporary coderun.md with smart context
-        if prompt.prompt_text:
-            coderun_file = temp_dir / f"{proj.name}_coderun.md"
-            coderun_file.write_text(prompt.prompt_text)
-
-        if tmux:
-            # Use tmux session
-            session_name = f"claude-{proj.name}"
-            cmd = f"tmux new-session -d -s '{session_name}' -c '{project_path}' 'claude --resume || claude'"
-            if not dry_run:
-                result = subprocess.run(cmd, shell=True, capture_output=True)
-                if result.returncode == 0:
-                    console.print(f"[green]✓[/green] Launched tmux session: {session_name}")
-                    launched += 1
-                else:
-                    console.print(f"[red]✗[/red] Failed to launch {proj.name}")
-        elif use_claudecoderun and len(projects) > 1:
-            # Use claudecoderun for batch launching
-            if i == 0:  # Only launch once with all paths
-                project_paths = [p.path for p in projects]
-                # Create a temp file listing all projects
-                batch_file = temp_dir / "batch_projects.txt"
-                batch_file.write_text("\n".join(project_paths))
-
-                run_script = claudecoderun_path / "run.sh"
-                if run_script.exists():
-                    cmd_parts = [str(run_script)]
-                    cmd_parts.extend(project_paths)
-                    if parallel > 1:
-                        cmd_parts.extend(["--parallel", "--max-parallel", str(parallel)])
-                    cmd_parts.append("--delay=2")
-
-                    console.print(f"\n[dim]Calling claudecoderun with {len(projects)} projects[/dim]")
-                    subprocess.Popen(cmd_parts, cwd=claudecoderun_path)
-                    launched = len(projects)
-                break
-        else:
-            # Use iTerm2 directly via AppleScript
-            script_path = Path(__file__).parent.parent / "scripts" / "claude-launch.sh"
-            if script_path.exists():
-                subprocess.Popen([str(script_path), proj.name])
-                console.print(f"[green]✓[/green] Launched iTerm2 for {proj.name}")
-                launched += 1
-            else:
-                # Fallback to basic Terminal
-                cmd = f'''osascript -e 'tell application "Terminal" to do script "cd {project_path} && claude --resume || claude"' '''
-                subprocess.run(cmd, shell=True)
-                console.print(f"[green]✓[/green] Launched Terminal for {proj.name}")
-                launched += 1
-
-        # Delay between launches if parallel is 1
-        if parallel == 1 and i < len(projects) - 1:
-            import time
-            time.sleep(1)
-
-    console.print(f"\n[bold green]Launched {launched} project(s)[/bold green]")
-    session.close()
 
 
 @main.command()
@@ -618,12 +494,7 @@ def health(filter_str: Optional[str], limit: int, asc: bool):
     # Build query
     query = session.query(Project)
 
-    # Apply filters
-    if filter_str:
-        if filter_str.startswith("type:"):
-            category = filter_str.split(":")[1]
-            query = query.filter(Project.category == category)
-
+    query = apply_project_filter(query, filter_str)
     projects = query.all()
 
     # Calculate health scores and sort
@@ -852,42 +723,82 @@ def edit(project_name: str, notes: Optional[str], deadline: Optional[str],
 
 
 @main.command()
+@click.argument("project_name")
+def someday(project_name: str):
+    """Move a project to the Someday/Maybe pile (priority 5).
+
+    This is a quick way to park something without losing it.
+    Use 'pm backlog' to see all someday and archived projects.
+    Use 'pm edit <name> --priority 3' to pull it back to active.
+    """
+    init_db()
+    session = get_session()
+
+    project = session.query(Project).filter(
+        Project.name.ilike(f"%{project_name}%")
+    ).first()
+
+    if not project:
+        console.print(f"[red]No project found matching '{project_name}'[/red]")
+        session.close()
+        return
+
+    old_label = project.priority_label
+    project.priority = 5
+    session.commit()
+
+    sync_project_to_file(project)
+
+    console.print(f"[green]Moved '{project.name}' to Someday[/green] (was {old_label})")
+    console.print(f"[dim]View backlog: pm backlog | Restore: pm edit {project.name} --priority 3[/dim]")
+    session.close()
+
+
+@main.command()
 @click.option("--filter", "-f", "filter_str", help="Filter: type:client, priority:1, overdue, tagged:foo")
 @click.option("--limit", "-n", default=20, help="Limit results")
-def urgent(filter_str: Optional[str], limit: int):
-    """Show projects by urgency (deadlines + priority)."""
+@click.option("--all", "show_all", is_flag=True, help="Show all projects sorted by urgency (not just urgent ones)")
+def urgent(filter_str: Optional[str], limit: int, show_all: bool):
+    """Show projects with real urgency signals (deadlines, priority 1/2, overdue).
+
+    By default only shows projects that have an actual urgency signal:
+    a deadline set, priority Critical/High, or an overdue target date.
+    Use --all to see every project ranked by urgency score.
+    """
     init_db()
     session = get_session()
 
     query = session.query(Project).filter(Project.archived == False)
 
-    # Apply filters
-    if filter_str:
-        if filter_str.startswith("type:"):
-            category = filter_str.split(":")[1]
-            query = query.filter(Project.category == category)
-        elif filter_str.startswith("priority:"):
-            p = int(filter_str.split(":")[1])
-            query = query.filter(Project.priority == p)
-        elif filter_str == "overdue":
-            query = query.filter(Project.deadline < datetime.utcnow())
-        elif filter_str.startswith("tagged:"):
-            tag = filter_str.split(":")[1]
-            query = query.filter(Project.tags.ilike(f"%{tag}%"))
-
+    query = apply_project_filter(query, filter_str)
     projects = query.all()
 
     # Sort by urgency
     projects_sorted = sorted(projects, key=lambda p: p.urgency_score, reverse=True)
+
+    # Default: only show projects with a real urgency signal
+    if not show_all:
+        projects_sorted = [
+            p for p in projects_sorted
+            if p.deadline is not None
+            or (p.priority is not None and p.priority <= 2)
+            or p.is_overdue
+            or (p.target_date is not None and p.days_until_target is not None and p.days_until_target <= 14)
+        ]
+
     if limit > 0:
         projects_sorted = projects_sorted[:limit]
 
     if not projects_sorted:
-        console.print("[yellow]No urgent projects found[/yellow]")
+        console.print("[yellow]No urgent projects found.[/yellow]")
+        console.print("[dim]Set a deadline: pm edit <project> --deadline YYYY-MM-DD[/dim]")
+        console.print("[dim]Or boost priority: pm edit <project> --priority 1[/dim]")
+        console.print("[dim]Use --all to see all projects ranked by urgency score.[/dim]")
         session.close()
         return
 
-    table = Table(title="Urgent Projects (by deadline & priority)", box=box.ROUNDED)
+    title = "All Projects by Urgency" if show_all else "Urgent Projects (deadlines · priority 1/2 · overdue)"
+    table = Table(title=title, box=box.ROUNDED)
     table.add_column("Project")
     table.add_column("Priority")
     table.add_column("Deadline")
@@ -983,27 +894,690 @@ def backlog(limit: int):
     session.close()
 
 
+# ── Tags ────────────────────────────────────────────────────────────────────
+
+
+@main.group()
+def tags():
+    """Manage project tags."""
+    pass
+
+
+@tags.command("list")
+def tags_list():
+    """List all tags with project counts."""
+    init_db()
+    session = get_session()
+
+    projects = session.query(Project).filter(Project.tags.isnot(None)).all()
+    tag_counts: dict[str, int] = {}
+    for p in projects:
+        for t in p.tags_list:
+            tag_counts[t] = tag_counts.get(t, 0) + 1
+
+    if not tag_counts:
+        console.print("[dim]No tags found across any projects[/dim]")
+        session.close()
+        return
+
+    table = Table(title="Tags", box=box.SIMPLE)
+    table.add_column("Tag")
+    table.add_column("Projects", justify="right")
+
+    for tag in sorted(tag_counts.keys()):
+        table.add_row(tag, str(tag_counts[tag]))
+
+    console.print(table)
+    console.print(f"\n[dim]{len(tag_counts)} unique tags across {sum(tag_counts.values())} assignments[/dim]")
+    session.close()
+
+
+@tags.command("add")
+@click.argument("project_name")
+@click.argument("tag")
+@click.option("--sync/--no-sync", default=True, help="Sync to PM-STATUS.md")
+def tags_add(project_name: str, tag: str, sync: bool):
+    """Add a tag to a project."""
+    init_db()
+    session = get_session()
+
+    project = session.query(Project).filter(Project.name.ilike(f"%{project_name}%")).first()
+    if not project:
+        console.print(f"[red]Project '{project_name}' not found[/red]")
+        session.close()
+        return
+
+    project.add_tag(tag)
+    session.commit()
+    console.print(f"[green]✓ Added tag '{tag}' to {project.name}[/green]")
+    console.print(f"  Tags: {', '.join(project.tags_list)}")
+
+    if sync:
+        _sync_project(project)
+
+    session.close()
+
+
+@tags.command("remove")
+@click.argument("project_name")
+@click.argument("tag")
+@click.option("--sync/--no-sync", default=True, help="Sync to PM-STATUS.md")
+def tags_remove(project_name: str, tag: str, sync: bool):
+    """Remove a tag from a project."""
+    init_db()
+    session = get_session()
+
+    project = session.query(Project).filter(Project.name.ilike(f"%{project_name}%")).first()
+    if not project:
+        console.print(f"[red]Project '{project_name}' not found[/red]")
+        session.close()
+        return
+
+    if tag not in project.tags_list:
+        console.print(f"[yellow]Tag '{tag}' not on {project.name}[/yellow]")
+        session.close()
+        return
+
+    project.remove_tag(tag)
+    session.commit()
+    console.print(f"[green]✓ Removed tag '{tag}' from {project.name}[/green]")
+    console.print(f"  Tags: {', '.join(project.tags_list) or '(none)'}")
+
+    if sync:
+        _sync_project(project)
+
+    session.close()
+
+
+@tags.command("bulk")
+@click.argument("tag")
+@click.argument("project_names", nargs=-1)
+@click.option("--filter", "-f", "filter_str", help="Filter: type:client, category:internal")
+@click.option("--sync/--no-sync", default=True, help="Sync to PM-STATUS.md")
+def tags_bulk(tag: str, project_names: tuple, filter_str: Optional[str], sync: bool):
+    """Apply a tag to multiple projects.
+
+    Examples:
+        pm tags bulk mobile myapp1 myapp2
+        pm tags bulk client-work --filter type:client
+    """
+    init_db()
+    session = get_session()
+
+    if project_names:
+        projects = []
+        for name in project_names:
+            p = session.query(Project).filter(Project.name.ilike(f"%{name}%")).first()
+            if p:
+                projects.append(p)
+            else:
+                console.print(f"[yellow]Not found: {name}[/yellow]")
+    elif filter_str:
+        query = apply_project_filter(session.query(Project), filter_str)
+        projects = query.all()
+    else:
+        console.print("[yellow]Specify project names or --filter[/yellow]")
+        session.close()
+        return
+
+    if not projects:
+        console.print("[red]No projects found[/red]")
+        session.close()
+        return
+
+    count = 0
+    for p in projects:
+        if tag not in p.tags_list:
+            p.add_tag(tag)
+            count += 1
+            if sync:
+                _sync_project(p)
+
+    session.commit()
+    console.print(f"[green]✓ Applied tag '{tag}' to {count} project(s)[/green]")
+    session.close()
+
+
+def _sync_project(project: Project) -> None:
+    """Sync project metadata to PM-STATUS.md."""
+    sync_project_to_file(project)
+
+
+main.add_command(tags)
+
+
+# ── Digest ──────────────────────────────────────────────────────────────────
+
+
+@main.command()
+@click.option("--start", "-s", "start_str", help="Start date YYYY-MM-DD (default: last Sunday)")
+@click.option("--end", "-e", "end_str", help="End date YYYY-MM-DD (default: today)")
+@click.option("--by-day", is_flag=True, help="Group by day instead of project/client")
+@click.option("--client", "-c", help="Filter by client name")
+def digest(start_str: Optional[str], end_str: Optional[str], by_day: bool, client: Optional[str]):
+    """Activity digest for a date range.
+
+    Default range: week-to-date (last Sunday through today).
+
+    Examples:
+        pm digest                              # Week-to-date by project
+        pm digest --by-day                     # Week-to-date by day
+        pm digest -s 2026-01-01 -e 2026-01-31  # January by project
+        pm digest --client "Acme"              # Filter by client
+    """
+
+    init_db()
+    session = get_session()
+
+    # Parse date range
+    default_start, default_end = week_to_date_range()
+    start_dt = datetime.strptime(start_str, "%Y-%m-%d") if start_str else default_start
+    end_dt = datetime.combine(datetime.strptime(end_str, "%Y-%m-%d").date(), datetime.max.time()) if end_str else default_end
+
+    range_label = f"{start_dt.strftime('%b %d')} – {end_dt.strftime('%b %d, %Y')}"
+
+    if by_day:
+        results = digest_by_day(session, start_dt, end_dt)
+        if not results:
+            console.print(f"[dim]No activity found for {range_label}[/dim]")
+            session.close()
+            return
+
+        table = Table(title=f"Activity by Day — {range_label}", box=box.SIMPLE)
+        table.add_column("Date")
+        table.add_column("Day")
+        table.add_column("#", justify="right")
+        table.add_column("Projects")
+
+        for r in results:
+            table.add_row(
+                r["date"].strftime("%Y-%m-%d"),
+                r["day_name"],
+                str(r["project_count"]),
+                ", ".join(r["project_names"][:10]) + ("..." if len(r["project_names"]) > 10 else ""),
+            )
+
+        console.print(table)
+        total_projects = len(set(n for r in results for n in r["project_names"]))
+        console.print(f"\n[dim]{len(results)} active days, {total_projects} unique projects[/dim]")
+    else:
+        results = digest_by_project(session, start_dt, end_dt, client_filter=client)
+        if not results:
+            console.print(f"[dim]No activity found for {range_label}[/dim]")
+            session.close()
+            return
+
+        table = Table(title=f"Activity by Project — {range_label}", box=box.SIMPLE)
+        table.add_column("Project")
+        table.add_column("Client")
+        table.add_column("Δ%", justify="right")
+        table.add_column("Current %", justify="right")
+        table.add_column("Last Commit")
+        table.add_column("Status")
+        table.add_column("Health", justify="right")
+
+        current_client = None
+        for r in results:
+            # Visual grouping by client
+            if r["client"] != current_client:
+                current_client = r["client"]
+                if current_client:
+                    table.add_section()
+
+            delta_str = f"+{r['completion_delta']:.0f}" if r["completion_delta"] > 0 else f"{r['completion_delta']:.0f}"
+            if r["completion_delta"] > 0:
+                delta_str = f"[green]{delta_str}[/green]"
+            elif r["completion_delta"] < 0:
+                delta_str = f"[red]{delta_str}[/red]"
+
+            health = r["health"]
+            h_color = "green" if health >= 70 else ("yellow" if health >= 40 else "red")
+
+            table.add_row(
+                r["name"],
+                r["client"] or "",
+                delta_str,
+                f"{r['current_completion']:.0f}",
+                (r["last_commit_msg"][:40] + "...") if len(r["last_commit_msg"]) > 40 else r["last_commit_msg"],
+                r["current_status"][:20] if r["current_status"] else "",
+                f"[{h_color}]{health}[/{h_color}]",
+            )
+
+        console.print(table)
+        console.print(f"\n[dim]{len(results)} projects with activity[/dim]")
+
+    session.close()
+
+
+# ── Brief ────────────────────────────────────────────────────────────────────
+
+
+@main.command()
+@click.option("--days", "-d", default=7, help="Lookback window in days (default: 7)")
+@click.option("--verbose", "-v", is_flag=True, help="Show next actions for high-priority projects")
+@click.option("--imessage", "-i", is_flag=True, help="Send brief via iMessage (requires cci session)")
+@click.option("--only-if-urgent", is_flag=True, help="Suppress output if nothing is urgent")
+def brief(days: int, verbose: bool, imessage: bool, only_if_urgent: bool):
+    """Daily intelligent briefing: deadlines, anomalies, high-priority, wins.
+
+    Surfaces only what matters — not a dump of all 600 projects.
+
+    Examples:
+        pm brief                      # Morning briefing to terminal
+        pm brief --verbose            # Include next actions
+        pm brief --imessage           # Send to iMessage (+12064962555)
+        pm brief --only-if-urgent     # Suppress if nothing needs attention
+    """
+
+    init_db()
+    session = get_session()
+
+    brief_data = build_brief(session, lookback_days=days)
+    session.close()
+
+    has_urgent = (
+        len(brief_data["deadlines"]) > 0
+        or len(brief_data["anomalies"]) > 0
+        or len(brief_data["high_priority"]) > 0
+    )
+
+    if only_if_urgent and not has_urgent:
+        return
+
+    if imessage:
+        # Send via iMessage using AppleScript
+        message = format_brief_imessage(brief_data)
+        phone = "+12064962555"
+        escaped = message.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "")
+        script = f'tell application "Messages" to send "{escaped}" to buddy "{phone}" of service "SMS"'
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                console.print("[green]Brief sent via iMessage[/green]")
+            else:
+                console.print(f"[yellow]iMessage send failed: {result.stderr.strip()}[/yellow]")
+                console.print("[dim]Falling back to terminal output:[/dim]")
+                console.print(format_brief_text(brief_data, verbose=verbose))
+        except subprocess.TimeoutExpired:
+            console.print("[yellow]iMessage timed out — showing in terminal instead[/yellow]")
+            console.print(format_brief_text(brief_data, verbose=verbose))
+    else:
+        text = format_brief_text(brief_data, verbose=verbose)
+        # Render with Rich color coding
+        for line in text.split("\n"):
+            if line.startswith("PM Brief"):
+                console.print(f"[bold cyan]{line}[/bold cyan]")
+            elif line.startswith("  ") and brief_data["summary"] in line:
+                console.print(f"[dim]{line}[/dim]")
+            elif line in ("DEADLINES", "HIGH PRIORITY", "ANOMALIES", "WINS") or line.startswith("NEWLY STALE"):
+                console.print(f"\n[bold yellow]{line}[/bold yellow]")
+            elif "OVERDUE" in line:
+                console.print(f"[red]{line}[/red]")
+            elif line.startswith("  ⏰") or line.startswith("  📅"):
+                console.print(f"[yellow]{line}[/yellow]")
+            elif line.startswith("  🔴"):
+                console.print(f"[red]{line}[/red]")
+            elif line.startswith("  ⚠️"):
+                console.print(f"[yellow]{line}[/yellow]")
+            elif line.startswith("  ✅"):
+                console.print(f"[green]{line}[/green]")
+            elif line.startswith("  💤"):
+                console.print(f"[dim]{line}[/dim]")
+            elif line:
+                console.print(line)
+            else:
+                console.print()
+
+    if not has_urgent and not only_if_urgent:
+        console.print("\n[green]All clear — no urgent items.[/green]")
+
+
+# ── Stale ───────────────────────────────────────────────────────────────────
+
+
+@main.command()
+@click.option("--days", "-d", default=30, help="Days of inactivity threshold (default: 30)")
+@click.option("--action", "-a", is_flag=True, help="Interactive: prompt for action on each project")
+def stale(days: int, action: bool):
+    """List stale projects (inactive N+ days, not archived, not someday).
+
+    Examples:
+        pm stale              # List stale projects (30+ days)
+        pm stale --days 60    # 60+ days inactive
+        pm stale --action     # Interactive: pick action for each
+    """
+    init_db()
+    session = get_session()
+
+    threshold = datetime.utcnow() - timedelta(days=days)
+    projects = session.query(Project).filter(
+        (Project.archived == False) | (Project.archived == None),
+        Project.priority != 5,
+        (Project.last_activity < threshold) | (Project.last_activity == None),
+    ).order_by(Project.last_activity.asc().nullsfirst()).all()
+
+    if not projects:
+        console.print(f"[green]No stale projects (inactive {days}+ days)[/green]")
+        session.close()
+        return
+
+    table = Table(title=f"Stale Projects (inactive {days}+ days)", box=box.ROUNDED)
+    table.add_column("Project")
+    table.add_column("Category")
+    table.add_column("Last Activity")
+    table.add_column("Days", justify="right")
+    table.add_column("Priority")
+    table.add_column("Done", justify="right")
+    table.add_column("Notes")
+
+    for p in projects:
+        days_inactive = (datetime.utcnow() - p.last_activity).days if p.last_activity else "—"
+        activity = p.last_activity.strftime("%Y-%m-%d") if p.last_activity else "never"
+        notes_preview = (p.notes[:30] + "...") if p.notes and len(p.notes) > 30 else (p.notes or "")
+
+        table.add_row(
+            p.name,
+            p.category or "",
+            activity,
+            str(days_inactive),
+            p.priority_label,
+            f"{p.completion_pct:.0f}%" if p.completion_pct else "—",
+            notes_preview,
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]Total: {len(projects)} stale projects[/dim]")
+
+    if action:
+        for p in projects:
+            _prompt_stale_action(session, p)
+
+    session.close()
+
+
+def _prompt_stale_action(session, project: Project) -> None:
+    """Prompt user for action on a stale project (interactive CLI)."""
+    console.print(f"\n[bold]{project.name}[/bold] — {project.path}")
+    if project.last_activity:
+        days_ago = (datetime.utcnow() - project.last_activity).days
+        console.print(f"  Last active: {project.last_activity.strftime('%Y-%m-%d')} ({days_ago}d ago)")
+    else:
+        console.print("  Last active: never")
+    console.print(f"  Completion: {project.completion_pct or 0:.0f}% | Priority: {project.priority_label}")
+    if project.notes:
+        console.print(f"  Notes: {project.notes[:80]}")
+
+    console.print("\n  [1] Archive   [2] Move forward   [3] Pivot")
+    console.print("  [4] Plan      [5] Combine        [6] Replace")
+    console.print("  [s] Skip")
+
+    choice = click.prompt("  Action", type=str, default="s").strip().lower()
+
+    if choice == "1":
+        reason = click.prompt("  Reason (optional)", default="", show_default=False)
+        project.archived = True
+        if reason:
+            project.notes = f"{project.notes or ''}\n\n[Archived {datetime.utcnow().strftime('%Y-%m-%d')}] {reason}".strip()
+        session.commit()
+        _sync_project(project)
+        console.print(f"  [green]✓ Archived {project.name}[/green]")
+
+    elif choice == "2":
+        next_action = click.prompt("  Next action")
+        new_pri = click.prompt("  Priority (1-4)", type=int, default=project.priority or 3)
+        project.next_action = next_action
+        project.priority = min(max(new_pri, 1), 4)
+        session.commit()
+        _sync_project(project)
+        console.print(f"  [green]✓ Updated {project.name}[/green]")
+
+    elif choice == "3":
+        direction = click.prompt("  New direction")
+        project.notes = f"{project.notes or ''}\n\n[Pivot {datetime.utcnow().strftime('%Y-%m-%d')}] {direction}".strip()
+        session.commit()
+        _sync_project(project)
+        console.print(f"  [green]✓ Updated notes for {project.name}[/green]")
+
+    elif choice == "4":
+        console.print(f"  [blue]Launching Claude Code for {project.name}...[/blue]")
+        cmd = f"cd '{project.path}' && claude"
+        terminal_launch_single(project.path, project.name, cmd)
+
+    elif choice == "5":
+        target_name = click.prompt("  Combine into which project?")
+        target = session.query(Project).filter(Project.name.ilike(f"%{target_name}%")).first()
+        if target:
+            project.archived = True
+            project.notes = f"{project.notes or ''}\n\n[Combined into {target.name} on {datetime.utcnow().strftime('%Y-%m-%d')}]".strip()
+            session.commit()
+            _sync_project(project)
+            console.print(f"  [green]✓ Archived {project.name}, combined into {target.name}[/green]")
+        else:
+            console.print(f"  [red]Project '{target_name}' not found[/red]")
+
+    elif choice == "6":
+        repl_name = click.prompt("  Replacement project name")
+        repl = session.query(Project).filter(Project.name.ilike(f"%{repl_name}%")).first()
+        if repl:
+            project.archived = True
+            project.notes = f"{project.notes or ''}\n\n[Replaced by {repl.name} on {datetime.utcnow().strftime('%Y-%m-%d')}]".strip()
+            session.commit()
+            _sync_project(project)
+            console.print(f"  [green]✓ Archived {project.name}, replaced by {repl.name}[/green]")
+        else:
+            console.print(f"  [red]Project '{repl_name}' not found[/red]")
+
+
+# ── Run Prompt ──────────────────────────────────────────────────────────────
+
+
+@main.command("run")
+@click.argument("project_name")
+@click.argument("prompt")
+@click.option("--budget", "-b", default=0.50, help="Max budget in USD (default: 0.50)")
+@click.option("--timeout", "-t", default=300, help="Timeout in seconds (default: 300)")
+@click.option("--tools", help="Allowed tools comma-separated (default: Read,Glob,Grep)")
+def run_prompt(project_name: str, prompt: str, budget: float, timeout: int, tools: Optional[str]):
+    """Run a prompt against a project via headless Claude Code.
+
+    Executes `claude -p` in the project directory, captures output,
+    and logs the result to transcripts/<project>/<timestamp>.md.
+
+    Examples:
+        pm run myproject "Summarize the architecture"
+        pm run myproject "List all TODO items" --budget 0.25
+        pm run myproject "Find security issues" --tools Read,Glob,Grep,WebSearch
+    """
+
+    init_db()
+    session = get_session()
+
+    project = session.query(Project).filter(Project.name.ilike(f"%{project_name}%")).first()
+    if not project:
+        console.print(f"[red]Project '{project_name}' not found[/red]")
+        session.close()
+        return
+
+    allowed_tools = [t.strip() for t in tools.split(",")] if tools else ["Read", "Glob", "Grep"]
+
+    console.print(f"[bold blue]Running prompt on {project.name}[/bold blue]")
+    console.print(f"  Budget: ${budget:.2f} | Timeout: {timeout}s | Tools: {', '.join(allowed_tools)}")
+    console.print(f"  Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
+    console.print()
+
+    cmd = [
+        "claude",
+        "-p", prompt,
+        "--output-format", "text",
+        "--dangerously-skip-permissions",
+        "--max-budget-usd", str(budget),
+        "--allowedTools", ",".join(allowed_tools),
+    ]
+
+    start_time = time.time()
+
+    with console.status("[bold green]Claude is thinking...", spinner="dots"):
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=str(project.path),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            duration = time.time() - start_time
+
+            if result.returncode != 0:
+                error_msg = result.stderr.strip() if result.stderr else f"Exit code {result.returncode}"
+                console.print(f"[red]Error:[/red] {error_msg}")
+                output_text = f"ERROR: {error_msg}"
+                status = "error"
+            else:
+                output_text = result.stdout.strip()
+                if not output_text:
+                    console.print("[yellow]Claude returned empty output[/yellow]")
+                    status = "empty"
+                else:
+                    console.print(Panel(output_text, title="Result", border_style="green"))
+                    status = "success"
+
+        except subprocess.TimeoutExpired:
+            duration = time.time() - start_time
+            console.print(f"[red]Timed out after {timeout}s[/red]")
+            output_text = f"TIMEOUT after {timeout}s"
+            status = "timeout"
+
+        except FileNotFoundError:
+            duration = time.time() - start_time
+            console.print("[red]'claude' command not found. Is Claude Code CLI installed?[/red]")
+            output_text = "ERROR: claude command not found"
+            status = "error"
+
+    # Log to transcript — sanitize project name to prevent path traversal
+    safe_name = re.sub(r'[^\w\-]', '_', project.name)
+    transcript_dir = Path(__file__).parent.parent / "transcripts" / safe_name
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    transcript_file = transcript_dir / f"{timestamp}.md"
+
+    transcript_content = f"""# Prompt Run: {project.name}
+
+- **Date:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}
+- **Status:** {status}
+- **Duration:** {duration:.1f}s
+- **Budget:** ${budget:.2f}
+- **Tools:** {', '.join(allowed_tools)}
+
+## Prompt
+
+{prompt}
+
+## Result
+
+{output_text}
+"""
+    transcript_file.write_text(transcript_content)
+    console.print(f"\n[dim]Transcript saved: {transcript_file}[/dim]")
+    console.print(f"[dim]Duration: {duration:.1f}s[/dim]")
+
+    session.close()
+
+
+@main.command("transcripts")
+@click.argument("project_name", required=False)
+@click.option("--limit", "-n", default=10, help="Number of transcripts to show")
+def list_transcripts(project_name: Optional[str], limit: int):
+    """List prompt run transcripts.
+
+    Examples:
+        pm transcripts                  # All recent transcripts
+        pm transcripts myproject        # Transcripts for one project
+        pm transcripts -n 20            # Show more
+    """
+    transcript_base = Path(__file__).parent.parent / "transcripts"
+
+    if not transcript_base.exists():
+        console.print("[dim]No transcripts yet. Use 'pm run' to create one.[/dim]")
+        return
+
+    if project_name:
+        import re as _re
+        safe_name = re.sub(r'[^\w\-]', '_', project_name)
+        dirs = [transcript_base / safe_name]
+    else:
+        dirs = [d for d in transcript_base.iterdir() if d.is_dir()]
+
+    files = []
+    for d in dirs:
+        if d.exists():
+            for f in d.glob("*.md"):
+                files.append((d.name, f))
+
+    files.sort(key=lambda x: x[1].name, reverse=True)
+    files = files[:limit]
+
+    if not files:
+        console.print("[dim]No transcripts found[/dim]")
+        return
+
+    table = Table(title="Prompt Transcripts", box=box.SIMPLE)
+    table.add_column("Project")
+    table.add_column("Date")
+    table.add_column("Status")
+    table.add_column("File")
+
+    for proj_name, f in files:
+        # Quick parse status from file
+        content = f.read_text()
+        status = "unknown"
+        for line in content.split("\n"):
+            if line.startswith("- **Status:**"):
+                status = line.split(":**")[1].strip()
+                break
+
+        ts = f.stem  # e.g. 20260201-143000
+        try:
+            dt = datetime.strptime(ts, "%Y%m%d-%H%M%S")
+            date_str = dt.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            date_str = ts
+
+        status_color = {"success": "green", "error": "red", "timeout": "yellow", "empty": "yellow"}.get(status, "dim")
+        table.add_row(proj_name, date_str, f"[{status_color}]{status}[/{status_color}]", str(f))
+
+    console.print(table)
+
+
 @main.command()
 @click.argument("target", default="10")
 @click.option("--dirty-only", "-d", is_flag=True, help="Only projects with uncommitted changes")
 @click.option("--dry-run", is_flag=True, help="Show what would be launched without launching")
-def launch(target: str, dirty_only: bool, dry_run: bool):
+@click.option("--terminal", is_flag=True, help="Force Terminal.app instead of iTerm2")
+def launch(target: str, dirty_only: bool, dry_run: bool, terminal: bool):
     """Launch Claude Code for projects.
 
     TARGET can be:
     - A number: Launch the N most recently modified projects
     - A project name: Launch that specific project
 
-    Opens iTerm2 tabs with Claude Code using --dangerously-skip-permissions --continue.
+    Uses iTerm2 if installed, otherwise falls back to Terminal.app.
+    Use --terminal to force Terminal.app.
 
     Examples:
         pm launch              # Launch top 10 most recent
         pm launch 5            # Launch top 5 most recent
         pm launch myproject    # Launch specific project by name
         pm launch -d           # Only projects with uncommitted changes
+        pm launch --terminal   # Force Terminal.app
     """
     init_db()
     session = get_session()
+
+    # Detect terminal once up front
+    term = detect_terminal(force_terminal=terminal)
 
     # Check if target is a number or project name
     try:
@@ -1057,37 +1631,24 @@ def launch(target: str, dirty_only: bool, dry_run: bool):
     console.print(table)
 
     if dry_run:
-        console.print("\n[dim]Dry run - no terminals opened[/dim]")
+        console.print(f"\n[dim]Dry run - would use {term.value} - no terminals opened[/dim]")
         session.close()
         return
 
-    # Launch each project in iTerm2
-    console.print(f"\n[bold blue]Opening {len(projects)} iTerm2 tabs...[/bold blue]")
+    console.print(f"\n[bold blue]Opening {len(projects)} sessions via {term.value}...[/bold blue]")
 
-    for i, p in enumerate(projects):
-        # AppleScript to open new iTerm tab and run claude
-        script = f'''
-        tell application "iTerm"
-            activate
-            tell current window
-                create tab with default profile
-                tell current session
-                    write text "cd '{p.path}' && transcript && claude --dangerously-skip-permissions --continue"
-                end tell
-            end tell
-        end tell
-        '''
+    # Build project tuples and launch via shared terminal module
+    project_tuples = [
+        (str(p.path), p.name, terminal_build_command(str(p.path)))
+        for p in projects
+    ]
 
-        try:
-            subprocess.run(["osascript", "-e", script], check=True, capture_output=True)
+    try:
+        terminal_launch_batch(project_tuples, terminal=term)
+        for p in projects:
             console.print(f"  [green]✓[/green] {p.name}")
-        except subprocess.CalledProcessError as e:
-            console.print(f"  [red]✗[/red] {p.name}: {e}")
-
-        # Small delay to prevent overwhelming iTerm
-        if i < len(projects) - 1:
-            import time
-            time.sleep(0.3)
+    except Exception as e:
+        console.print(f"  [red]✗[/red] Failed to launch: {e}")
 
     console.print(f"\n[bold green]Launched {len(projects)} Claude Code sessions[/bold green]")
     session.close()
@@ -1114,8 +1675,12 @@ def shutdown(no_context: bool, dry_run: bool, context_wait: int):
         pm shutdown --no-context # Quick shutdown, skip context
         pm shutdown --dry-run    # Preview what would happen
     """
-    import threading
-    import time
+
+    # Shutdown requires iTerm2 — Terminal.app doesn't support session enumeration
+    if not is_shutdown_supported():
+        console.print("[yellow]Shutdown requires iTerm2 (not installed).[/yellow]")
+        console.print("[dim]Terminal.app does not support session enumeration or named tabs.[/dim]")
+        return
 
     # AppleScript to get all iTerm2 tab info
     get_tabs_script = '''
@@ -1140,7 +1705,12 @@ def shutdown(no_context: bool, dry_run: bool, context_wait: int):
         )
         raw_output = result.stdout.strip()
     except subprocess.CalledProcessError as e:
-        console.print(f"[red]Failed to get iTerm2 tabs: {e}[/red]")
+        stderr = e.stderr or ""
+        if "not running" in stderr.lower() or "can't get" in stderr.lower():
+            console.print("[yellow]iTerm2 is not currently running.[/yellow]")
+            console.print("[dim]Open iTerm2 and launch some Claude Code sessions first.[/dim]")
+        else:
+            console.print(f"[red]Failed to get iTerm2 tabs: {stderr.strip() or e}[/red]")
         return
 
     # Parse the AppleScript output to find Claude sessions
@@ -1314,6 +1884,1198 @@ def shutdown(no_context: bool, dry_run: bool, context_wait: int):
         t.join()
 
     console.print(f"\n[bold green]Shutdown complete![/bold green]")
+
+
+@main.group()
+def docs():
+    """Document generation using headless Claude Code."""
+    pass
+
+
+@docs.command("list")
+def docs_list():
+    """List available document templates."""
+    from .docgen.templates import BUILTIN_TEMPLATES
+
+    table = Table(
+        title="Document Templates",
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold cyan",
+    )
+    table.add_column("ID", style="bold", width=16)
+    table.add_column("Name", width=22)
+    table.add_column("Output", width=24)
+    table.add_column("Budget", width=8)
+    table.add_column("Description", min_width=30)
+
+    for t in BUILTIN_TEMPLATES.values():
+        table.add_row(
+            t.id,
+            t.name,
+            t.output_path,
+            f"${t.max_budget_usd:.2f}",
+            t.description,
+        )
+
+    console.print(table)
+
+
+@docs.command("generate")
+@click.argument("templates_str")
+@click.argument("project_name", required=False)
+@click.option("--all", "gen_all", is_flag=True, help="Generate for all projects")
+@click.option("--filter", "-f", "filter_str", help="Filter projects: type:client, category:internal")
+@click.option("--top", type=int, help="Top N projects by urgency")
+@click.option("--parallel", "-p", default=3, help="Max parallel workers")
+@click.option("--dry-run", is_flag=True, help="Show what would be generated")
+@click.option("--force", is_flag=True, help="Regenerate even if recent")
+@click.option("--max-budget", type=float, help="Override per-project budget cap")
+@click.option("--output-dir", help="Override output directory")
+def docs_generate(
+    templates_str: str,
+    project_name: Optional[str],
+    gen_all: bool,
+    filter_str: Optional[str],
+    top: Optional[int],
+    parallel: int,
+    dry_run: bool,
+    force: bool,
+    max_budget: Optional[float],
+    output_dir: Optional[str],
+):
+    """Generate documents for projects.
+
+    TEMPLATES is a comma-separated list of template IDs (e.g. roadmap,architecture).
+
+    Examples:
+
+        pm docs generate roadmap myproject
+
+        pm docs generate architecture --all
+
+        pm docs generate code-review --filter type:client
+
+        pm docs generate status-report --top 10
+
+        pm docs generate roadmap,architecture myproject
+    """
+    from .docgen.templates import BUILTIN_TEMPLATES, get_template
+    from .docgen.context import build_context
+    from .docgen.executor import run_doc_generation, run_batch_generation, DocResult
+    from .database.models import DocGeneration
+
+    # Parse template IDs
+    template_ids = [t.strip() for t in templates_str.split(",")]
+    templates = []
+    for tid in template_ids:
+        tmpl = get_template(tid)
+        if tmpl is None:
+            console.print(f"[red]Unknown template: {tid}[/red]")
+            console.print(f"Available: {', '.join(BUILTIN_TEMPLATES.keys())}")
+            return
+        templates.append(tmpl)
+
+    init_db()
+    session = get_session()
+
+    # Find target projects
+    if project_name:
+        project = session.query(Project).filter(
+            Project.name.ilike(f"%{project_name}%")
+        ).first()
+        if not project:
+            console.print(f"[red]Project '{project_name}' not found[/red]")
+            session.close()
+            return
+        projects = [project]
+    elif gen_all:
+        projects = session.query(Project).filter(
+            (Project.archived == False) | (Project.archived == None)
+        ).all()
+    elif filter_str:
+        query = session.query(Project).filter(
+            (Project.archived == False) | (Project.archived == None)
+        )
+        query = apply_project_filter(query, filter_str)
+        projects = query.all()
+    elif top:
+        all_projects = session.query(Project).filter(
+            (Project.archived == False) | (Project.archived == None)
+        ).all()
+        all_projects.sort(key=lambda p: p.urgency_score, reverse=True)
+        projects = all_projects[:top]
+    else:
+        console.print("[yellow]Specify a project name, --all, --filter, or --top[/yellow]")
+        session.close()
+        return
+
+    if not projects:
+        console.print("[yellow]No projects found[/yellow]")
+        session.close()
+        return
+
+    # Check for staleness (skip recent unless --force)
+    stale_days = 7
+    tasks_to_run = []
+
+    for project in projects:
+        ctx = build_context(project)
+        for tmpl in templates:
+            # Check if recently generated
+            if not force:
+                recent = session.query(DocGeneration).filter(
+                    DocGeneration.project_id == project.id,
+                    DocGeneration.template_id == tmpl.id,
+                    DocGeneration.status == "success",
+                ).order_by(DocGeneration.generated_at.desc()).first()
+
+                if recent and recent.generated_at:
+                    from datetime import timedelta
+                    age = datetime.utcnow() - recent.generated_at
+                    if age < timedelta(days=stale_days):
+                        if not dry_run:
+                            console.print(
+                                f"[dim]Skipping {project.name}/{tmpl.id} "
+                                f"(generated {age.days}d ago, use --force)[/dim]"
+                            )
+                        continue
+
+            # Resolve output file
+            out_dir = output_dir or tmpl.output_dir
+            filename = tmpl.output_filename
+            if "{date}" in filename:
+                filename = filename.replace("{date}", datetime.now().strftime("%Y-%m-%d"))
+
+            output_file = Path(project.path) / out_dir / filename
+            budget = max_budget if max_budget else tmpl.max_budget_usd
+
+            # Handle weekly-summary specially (multi-project)
+            if tmpl.id == "weekly-summary":
+                # Build cross-project context as notes
+                summary_lines = []
+                for p in projects:
+                    pct = p.completion_pct or 0
+                    summary_lines.append(
+                        f"- {p.name} ({p.category}): {pct:.0f}% complete, "
+                        f"health {p.health_score}/100, "
+                        f"phase: {p.current_phase or 'unknown'}, "
+                        f"next: {p.next_action or 'none'}"
+                    )
+                ctx.notes = "\n".join(summary_lines)
+
+            prompt = tmpl.render(ctx)
+
+            tasks_to_run.append({
+                "project_path": Path(project.path),
+                "prompt": prompt,
+                "output_file": output_file,
+                "max_budget_usd": budget,
+                "allowed_tools": tmpl.allowed_tools,
+                "project_id": project.id,
+                "template_id": tmpl.id,
+                "output_rel": f"{out_dir}/{filename}",
+            })
+
+    if not tasks_to_run:
+        console.print("[yellow]Nothing to generate (all docs are up-to-date)[/yellow]")
+        session.close()
+        return
+
+    # Dry run - show what would be generated
+    if dry_run:
+        table = Table(title="Documents to Generate (dry run)", box=box.SIMPLE)
+        table.add_column("Project")
+        table.add_column("Template")
+        table.add_column("Output")
+        table.add_column("Budget")
+
+        for task in tasks_to_run:
+            table.add_row(
+                task["project_path"].name,
+                task["template_id"],
+                task["output_rel"],
+                f"${task['max_budget_usd']:.2f}",
+            )
+
+        console.print(table)
+        console.print(f"\n[dim]{len(tasks_to_run)} documents would be generated[/dim]")
+        session.close()
+        return
+
+    # Execute generation
+    console.print(f"[bold blue]Generating {len(tasks_to_run)} documents "
+                  f"(max {parallel} parallel)...[/bold blue]")
+
+    def on_result(result: DocResult):
+        if result.status == "success":
+            console.print(
+                f"  [green]OK[/green] {result.project_name}/{result.template_id} "
+                f"({result.duration_secs:.1f}s, {result.file_size_bytes} bytes)"
+            )
+        elif result.status == "timeout":
+            console.print(
+                f"  [yellow]TIMEOUT[/yellow] {result.project_name}/{result.template_id} "
+                f"({result.error_message})"
+            )
+        else:
+            console.print(
+                f"  [red]ERROR[/red] {result.project_name}/{result.template_id}: "
+                f"{result.error_message}"
+            )
+
+    results = run_batch_generation(
+        tasks=[{k: v for k, v in t.items() if k not in ("project_id", "template_id", "output_rel")}
+               for t in tasks_to_run],
+        max_workers=parallel,
+        progress_callback=on_result,
+    )
+
+    # Record results in database
+    for task, result in zip(tasks_to_run, results):
+        doc_gen = DocGeneration(
+            project_id=task["project_id"],
+            template_id=task["template_id"],
+            output_path=task["output_rel"],
+            generated_at=datetime.utcnow(),
+            duration_secs=result.duration_secs,
+            status=result.status,
+            error_message=result.error_message if result.status != "success" else None,
+            file_size_bytes=result.file_size_bytes,
+        )
+        session.add(doc_gen)
+
+    session.commit()
+
+    # Summary
+    success = sum(1 for r in results if r.status == "success")
+    errors = sum(1 for r in results if r.status == "error")
+    timeouts = sum(1 for r in results if r.status == "timeout")
+
+    console.print()
+    console.print(Panel(
+        f"[green]Success: {success}[/green]  "
+        f"[red]Errors: {errors}[/red]  "
+        f"[yellow]Timeouts: {timeouts}[/yellow]",
+        title="Generation Complete",
+        border_style="green" if errors == 0 else "yellow",
+    ))
+
+    session.close()
+
+
+@docs.command("history")
+@click.argument("project_name", required=False)
+@click.option("--limit", "-n", default=20, help="Limit results")
+def docs_history(project_name: Optional[str], limit: int):
+    """Show document generation history."""
+    from .database.models import DocGeneration
+
+    init_db()
+    session = get_session()
+
+    query = session.query(DocGeneration).order_by(DocGeneration.generated_at.desc())
+
+    if project_name:
+        # Find matching project
+        project = session.query(Project).filter(
+            Project.name.ilike(f"%{project_name}%")
+        ).first()
+        if not project:
+            console.print(f"[red]Project '{project_name}' not found[/red]")
+            session.close()
+            return
+        query = query.filter(DocGeneration.project_id == project.id)
+
+    if limit > 0:
+        query = query.limit(limit)
+
+    records = query.all()
+
+    if not records:
+        console.print("[yellow]No generation history found[/yellow]")
+        session.close()
+        return
+
+    table = Table(title="Document Generation History", box=box.ROUNDED)
+    table.add_column("Date", width=18)
+    table.add_column("Project", width=20)
+    table.add_column("Template", width=16)
+    table.add_column("Status", width=10)
+    table.add_column("Duration", width=10)
+    table.add_column("Size", width=10)
+    table.add_column("Output", min_width=20)
+
+    for rec in records:
+        # Get project name
+        proj = session.query(Project).filter_by(id=rec.project_id).first()
+        proj_name = proj.name if proj else rec.project_id
+
+        # Status styling
+        status_styles = {"success": "green", "error": "red", "timeout": "yellow"}
+        style = status_styles.get(rec.status, "white")
+
+        # Format date
+        date_str = rec.generated_at.strftime("%Y-%m-%d %H:%M") if rec.generated_at else "—"
+
+        # Format duration
+        dur_str = f"{rec.duration_secs:.1f}s" if rec.duration_secs else "—"
+
+        # Format size
+        if rec.file_size_bytes:
+            if rec.file_size_bytes > 1024:
+                size_str = f"{rec.file_size_bytes / 1024:.1f}KB"
+            else:
+                size_str = f"{rec.file_size_bytes}B"
+        else:
+            size_str = "—"
+
+        table.add_row(
+            date_str,
+            proj_name,
+            rec.template_id,
+            f"[{style}]{rec.status}[/{style}]",
+            dur_str,
+            size_str,
+            rec.output_path or "—",
+        )
+
+    console.print(table)
+    session.close()
+
+
+@docs.command("status")
+@click.argument("project_name", required=False)
+@click.option("--stale-days", default=7, help="Days before a doc is considered stale")
+def docs_status(project_name: Optional[str], stale_days: int):
+    """Show which documents exist and their freshness.
+
+    Displays a grid of projects vs document types with last-generated timestamps.
+    """
+    from .docgen.templates import BUILTIN_TEMPLATES
+    from .database.models import DocGeneration
+    from datetime import timedelta
+
+    init_db()
+    session = get_session()
+
+    # Get projects
+    query = session.query(Project).filter(
+        (Project.archived == False) | (Project.archived == None)
+    )
+    if project_name:
+        query = query.filter(Project.name.ilike(f"%{project_name}%"))
+
+    projects = query.order_by(Project.name).all()
+
+    if not projects:
+        console.print("[yellow]No projects found[/yellow]")
+        session.close()
+        return
+
+    # Template IDs (excluding weekly-summary which is cross-project)
+    template_ids = [t.id for t in BUILTIN_TEMPLATES.values() if t.id != "weekly-summary"]
+
+    table = Table(title="Document Status", box=box.ROUNDED)
+    table.add_column("Project", style="bold", width=20)
+
+    for tid in template_ids:
+        table.add_column(tid, width=14)
+
+    stale_threshold = datetime.utcnow() - timedelta(days=stale_days)
+
+    for proj in projects:
+        row = [proj.name]
+
+        for tid in template_ids:
+            # Check latest generation
+            latest = session.query(DocGeneration).filter(
+                DocGeneration.project_id == proj.id,
+                DocGeneration.template_id == tid,
+                DocGeneration.status == "success",
+            ).order_by(DocGeneration.generated_at.desc()).first()
+
+            if latest and latest.generated_at:
+                age_days = (datetime.utcnow() - latest.generated_at).days
+                if latest.generated_at < stale_threshold:
+                    row.append(f"[yellow]{age_days}d ago[/yellow]")
+                else:
+                    row.append(f"[green]{age_days}d ago[/green]")
+            else:
+                # Check if file exists on disk
+                tmpl = BUILTIN_TEMPLATES[tid]
+                doc_path = Path(proj.path) / tmpl.output_dir / tmpl.output_filename
+                if doc_path.exists():
+                    row.append("[dim]exists*[/dim]")
+                else:
+                    row.append("[dim]—[/dim]")
+
+        table.add_row(*row)
+
+    console.print(table)
+    console.print(f"\n[dim]* = file exists but no generation record  |  "
+                  f"Stale threshold: {stale_days} days[/dim]")
+    session.close()
+
+
+# ── Agent Orchestration ──────────────────────────────────────────────────────
+
+
+def _record_agent_run(
+    project_id: str,
+    assessment,
+    run_result,
+    status: str,
+    started: datetime,
+) -> None:
+    """Persist an AgentRun record to the database."""
+    from .database.models import AgentRun
+    try:
+        session = get_session()
+        now = datetime.utcnow()
+        total_duration = (now - started).total_seconds()
+        run = AgentRun(
+            project_id=project_id,
+            started_at=started,
+            completed_at=now,
+            duration_secs=total_duration,
+            confidence=assessment.confidence if assessment else None,
+            proposed_action=assessment.proposed_action if assessment else None,
+            proposed_prompt=assessment.proposed_prompt if assessment else None,
+            reasoning=assessment.reasoning if assessment else None,
+            risk_level=assessment.risk_level if assessment else None,
+            assess_duration_secs=assessment.duration_secs if assessment else None,
+            status=status,
+            output=run_result.output[:2000] if run_result and run_result.output else None,
+            error_message=run_result.error if run_result else None,
+            cost_usd=run_result.cost_usd if run_result else None,
+        )
+        session.add(run)
+        session.commit()
+        session.close()
+    except Exception:
+        pass  # Never let DB writes crash the agent
+
+
+@main.group()
+def agent():
+    """Agent orchestration: assess, execute, and escalate project work."""
+    pass
+
+
+@agent.command("assess")
+@click.argument("project_name")
+@click.option("--context", "-c", help="Focus hint for the assessment (e.g. 'fix failing tests')")
+@click.option("--timeout", default=120, help="Seconds before assessment times out (default: 120)")
+def agent_assess(project_name: str, context: Optional[str], timeout: int):
+    """Assess a project and show the proposed next action.
+
+    Runs read-only Claude to understand current state and returns a JSON assessment
+    with confidence score and proposed action. Does NOT execute anything.
+
+    Examples:
+        pm agent assess myproject
+        pm agent assess myproject --context "fix failing tests"
+    """
+    from .agent.planner import plan_project
+
+    init_db()
+    session = get_session()
+    project = session.query(Project).filter(
+        Project.name.ilike(f"%{project_name}%")
+    ).first()
+    session.close()
+
+    if not project:
+        console.print(f"[red]No project found matching '{project_name}'[/red]")
+        return
+
+    console.print(f"[bold blue]Assessing {project.name}...[/bold blue]")
+    console.print(f"[dim]{project.path}[/dim]")
+
+    result = plan_project(project.path, project.name, context_hint=context, timeout=timeout)
+
+    # Display result
+    color = "green" if result.confidence >= 80 else "yellow" if result.confidence >= 50 else "red"
+    console.print(f"\n[bold]Confidence:[/bold] [{color}]{result.confidence}/100[/{color}]")
+    console.print(f"[bold]Risk:[/bold] {result.risk_level}")
+    console.print(f"[bold]Action:[/bold] {result.proposed_action}")
+    console.print(f"\n[bold]Reasoning:[/bold]\n{result.reasoning}")
+    console.print(f"\n[bold]Proposed prompt:[/bold]\n[dim]{result.proposed_prompt}[/dim]")
+
+    if result.should_auto_execute:
+        console.print(f"\n[green]✓ Would auto-execute (confidence ≥ 80, risk = safe)[/green]")
+        console.print(f"[dim]Run: pm agent run {project.name}[/dim]")
+    else:
+        reasons = []
+        if result.confidence < 80:
+            reasons.append(f"confidence {result.confidence} < 80")
+        if result.risk_level != "safe":
+            reasons.append(f"risk = {result.risk_level}")
+        if result.error:
+            reasons.append(f"error: {result.error}")
+        console.print(f"\n[yellow]Would escalate ({', '.join(reasons)})[/yellow]")
+
+    console.print(f"\n[dim]Assessment took {result.duration_secs:.1f}s[/dim]")
+
+
+@agent.command("run")
+@click.argument("project_name")
+@click.option("--context", "-c", help="Focus hint for the assessment")
+@click.option("--budget", default=1.00, help="Max budget in USD (default: 1.00)")
+@click.option("--timeout", default=300, help="Timeout in seconds (default: 300)")
+@click.option("--force", is_flag=True, help="Execute even if confidence < 80 or risk is not safe")
+@click.option("--dry-run", is_flag=True, help="Assess only, don't execute")
+def agent_run(
+    project_name: str,
+    context: Optional[str],
+    budget: float,
+    timeout: int,
+    force: bool,
+    dry_run: bool,
+):
+    """Assess and optionally execute work on a project.
+
+    Runs a two-phase protocol:
+      1. Assess: read-only analysis, confidence score, proposed action
+      2. Execute: if confidence >= 80 and risk = safe (or --force)
+
+    Examples:
+        pm agent run myproject                # assess then auto-execute if safe
+        pm agent run myproject --dry-run      # assess only
+        pm agent run myproject --force        # execute regardless of confidence
+    """
+    from .agent.planner import plan_project
+    from .agent.runner import AgentRunner
+    from .database.models import AgentRun
+
+    init_db()
+    session = get_session()
+    project = session.query(Project).filter(
+        Project.name.ilike(f"%{project_name}%")
+    ).first()
+    session.close()
+
+    if not project:
+        console.print(f"[red]No project found matching '{project_name}'[/red]")
+        return
+
+    started = datetime.utcnow()
+
+    # Phase 1: Assess
+    console.print(f"[bold blue]Phase 1: Assessing {project.name}...[/bold blue]")
+    assessment = plan_project(project.path, project.name, context_hint=context)
+
+    color = "green" if assessment.confidence >= 80 else "yellow" if assessment.confidence >= 50 else "red"
+    console.print(f"  Confidence: [{color}]{assessment.confidence}/100[/{color}]  "
+                  f"Risk: {assessment.risk_level}")
+    console.print(f"  Action: {assessment.proposed_action}")
+
+    if dry_run:
+        console.print("\n[dim]--dry-run: skipping execution[/dim]")
+        _record_agent_run(project.id, assessment, None, "dry_run", started)
+        return
+
+    # Phase 2: Execute or escalate
+    will_execute = assessment.should_auto_execute or force
+    if not will_execute:
+        reasons = []
+        if assessment.confidence < 80:
+            reasons.append(f"confidence {assessment.confidence} < 80")
+        if assessment.risk_level != "safe":
+            reasons.append(f"risk = {assessment.risk_level}")
+        console.print(f"\n[yellow]Escalating ({', '.join(reasons)})[/yellow]")
+        console.print(f"[dim]Use --force to execute anyway[/dim]")
+        _record_agent_run(project.id, assessment, None, "escalated", started)
+        return
+
+    console.print(f"\n[bold blue]Phase 2: Executing...[/bold blue]")
+    console.print(f"[dim]{assessment.proposed_prompt[:200]}[/dim]")
+
+    runner = AgentRunner(budget_usd=budget, timeout_secs=timeout)
+    run_result = runner.run(
+        project_path=project.path,
+        project_name=project.name,
+        prompt=assessment.proposed_prompt,
+        assessment=assessment,
+    )
+
+    _record_agent_run(project.id, assessment, run_result, run_result.status, started)
+
+    if run_result.status == "success":
+        console.print(f"\n[green]✓ Execution successful ({run_result.duration_secs:.1f}s)[/green]")
+        if run_result.output:
+            preview = run_result.output[:500]
+            if len(run_result.output) > 500:
+                preview += f"\n[dim]... ({len(run_result.output)} chars total)[/dim]"
+            console.print(f"\n{preview}")
+    else:
+        console.print(f"\n[red]✗ Execution {run_result.status}[/red]")
+        if run_result.error:
+            console.print(f"[dim]{run_result.error}[/dim]")
+
+
+@agent.command("batch")
+@click.option("--filter", "-f", "filter_str", help="Filter: type:client, priority:1")
+@click.option("--limit", "-n", default=5, help="Max projects to process (default: 5)")
+@click.option("--budget", default=1.00, help="Budget per project in USD (default: 1.00)")
+@click.option("--workers", default=3, help="Parallel workers (default: 3)")
+@click.option("--context", "-c", help="Focus hint for all assessments")
+@click.option("--dry-run", is_flag=True, help="Assess only, don't execute")
+def agent_batch(
+    filter_str: Optional[str],
+    limit: int,
+    budget: float,
+    workers: int,
+    context: Optional[str],
+    dry_run: bool,
+):
+    """Run assess/execute/escalate across multiple projects in parallel.
+
+    Processes up to --limit projects concurrently using --workers threads.
+    Projects are selected by urgency score (most urgent first).
+
+    Examples:
+        pm agent batch --limit 10 --dry-run     # assess top 10 by urgency
+        pm agent batch --filter type:client      # clients only
+        pm agent batch --budget 0.50             # conservative budget
+    """
+    from .agent.coordinator import AgentCoordinator
+
+    init_db()
+    session = get_session()
+
+    query = session.query(Project).filter(Project.archived == False)
+    query = apply_project_filter(query, filter_str)
+    projects = query.all()
+    session.close()
+
+    # Sort by urgency, take top N
+    projects_sorted = sorted(projects, key=lambda p: p.urgency_score, reverse=True)[:limit]
+
+    if not projects_sorted:
+        console.print("[yellow]No projects found.[/yellow]")
+        return
+
+    console.print(f"[bold blue]Agent batch: {len(projects_sorted)} projects "
+                  f"({'dry run' if dry_run else 'assess + execute'})[/bold blue]")
+
+    project_dicts = [{"name": p.name, "path": p.path} for p in projects_sorted]
+
+    coordinator = AgentCoordinator(
+        max_workers=workers,
+        budget_per_project=budget,
+        dry_run=dry_run,
+    )
+
+    coord_result = coordinator.run(project_dicts, context_hint=context)
+
+    # Display summary table
+    table = Table("Project", "Confidence", "Risk", "Action", "Status")
+    for assessment in coord_result.assessments:
+        # Find matching execution
+        exec_result = next(
+            (r for r in coord_result.executions if r.project_name == assessment.project_name),
+            None
+        )
+        status = "dry_run" if dry_run else (
+            exec_result.status if exec_result else
+            "escalated" if not assessment.should_auto_execute else "queued"
+        )
+        color = "green" if assessment.confidence >= 80 else "yellow" if assessment.confidence >= 50 else "red"
+        table.add_row(
+            assessment.project_name,
+            f"[{color}]{assessment.confidence}[/{color}]",
+            assessment.risk_level,
+            assessment.proposed_action[:60],
+            status,
+        )
+
+    console.print(table)
+    console.print(f"\n[dim]{coord_result.summary()}[/dim]")
+
+
+@agent.command("memory")
+@click.argument("project_name")
+@click.option("--clear", is_flag=True, help="Delete the AGENT-CONTEXT.md file")
+def agent_memory(project_name: str, clear: bool):
+    """View or clear the agent memory for a project.
+
+    The agent memory (docs/AGENT-CONTEXT.md) records what agents have done
+    and learned about each project, preventing duplicate work.
+    """
+    from .agent.memory import read_memory, clear_memory as _clear_memory
+
+    session = get_session()
+    project = session.query(Project).filter(
+        Project.name.ilike(f"%{project_name}%")
+    ).first()
+    session.close()
+
+    if not project:
+        console.print(f"[red]No project found matching '{project_name}'[/red]")
+        raise SystemExit(1)
+
+    project_path = Path(project.path)
+    mem_file = project_path / "docs" / "AGENT-CONTEXT.md"
+
+    if clear:
+        if _clear_memory(project_path):
+            console.print(f"[green]Cleared agent memory for {project.name}[/green]")
+        else:
+            console.print(f"[red]Failed to clear memory for {project.name}[/red]")
+        return
+
+    mem = read_memory(project_path)
+
+    if mem.is_empty() and not mem.last_run:
+        console.print(f"[dim]No agent memory for {project.name} ({mem_file})[/dim]")
+        return
+
+    console.print(f"\n[bold]Agent Memory: {project.name}[/bold]")
+    console.print(f"[dim]{mem_file}[/dim]\n")
+
+    if mem.last_run:
+        console.print(f"Last run: [cyan]{mem.last_run.strftime('%Y-%m-%d %H:%M')}[/cyan]  "
+                      f"Total runs: {mem.runs}  Cost: ${mem.total_cost_usd:.2f}")
+        console.print()
+
+    if mem.done:
+        console.print("[bold]What I've Done[/bold]")
+        for item in mem.done[-15:]:
+            console.print(f"  [green]•[/green] {item}")
+        console.print()
+
+    if mem.learned:
+        console.print("[bold]What I've Learned[/bold]")
+        for item in mem.learned:
+            console.print(f"  [blue]•[/blue] {item}")
+        console.print()
+
+    if mem.dont_repeat:
+        console.print("[bold]Don't Repeat[/bold]")
+        for item in mem.dont_repeat:
+            console.print(f"  [yellow]•[/yellow] {item}")
+        console.print()
+
+
+@agent.command("costs")
+@click.option("--days", default=30, help="Lookback window in days (default: 30)")
+@click.option("--limit", "-n", default=20, help="Max projects to show (default: 20)")
+def agent_costs(days: int, limit: int):
+    """Show per-project agent run costs and activity.
+
+    Reads the agent_runs table and summarises spend, run counts, and
+    success rates per project over the lookback window.
+    """
+    from .database.models import AgentRun
+    from sqlalchemy import func
+
+    cutoff = datetime.utcnow() - timedelta(days=days)
+
+    session = get_session()
+
+    # Aggregate by project
+    rows = (
+        session.query(
+            Project.name,
+            Project.client_name,
+            func.count(AgentRun.id).label("runs"),
+            func.sum(AgentRun.cost_usd).label("total_cost"),
+            func.avg(AgentRun.duration_secs).label("avg_duration"),
+            func.max(AgentRun.started_at).label("last_run"),
+        )
+        .join(AgentRun, AgentRun.project_id == Project.id)
+        .filter(AgentRun.started_at >= cutoff)
+        .group_by(Project.id)
+        .order_by(func.sum(AgentRun.cost_usd).desc())
+        .limit(limit)
+        .all()
+    )
+    session.close()
+
+    if not rows:
+        console.print(f"[dim]No agent runs in the last {days} days.[/dim]")
+        return
+
+    table = Table(
+        "Project", "Client", "Runs", "Total Cost", "Avg Duration", "Last Run",
+        title=f"Agent Costs — Last {days} days",
+    )
+    total_cost = 0.0
+    total_runs = 0
+    for row in rows:
+        cost = row.total_cost or 0.0
+        total_cost += cost
+        total_runs += row.runs
+        last_run = row.last_run.strftime("%Y-%m-%d") if row.last_run else "—"
+        avg_dur = f"{row.avg_duration:.0f}s" if row.avg_duration else "—"
+        table.add_row(
+            row.name,
+            row.client_name or "",
+            str(row.runs),
+            f"${cost:.3f}",
+            avg_dur,
+            last_run,
+        )
+
+    console.print(table)
+    console.print(
+        f"\n[bold]Total:[/bold] {total_runs} runs, "
+        f"[bold]${total_cost:.3f}[/bold] over {days} days"
+    )
+
+    # Budget alert: warn if weekly spend > $10
+    weekly_cost = total_cost * (7 / days) if days > 7 else total_cost
+    if weekly_cost > 10.0:
+        console.print(
+            f"\n[yellow]⚠ Estimated weekly spend: ${weekly_cost:.2f} — "
+            f"consider reviewing agent batch frequency[/yellow]"
+        )
+
+
+# ── Intelligent Triage ───────────────────────────────────────────────────────
+
+_TRIAGE_SYSTEM_PROMPT = """\
+You are an intelligent project manager performing decision triage.
+A project has a pending decision that needs resolution.
+Your job is to:
+1. Read the project files to understand the decision context
+2. Analyze the options available
+3. Recommend the best option with clear reasoning
+4. Estimate confidence in your recommendation
+
+Output ONLY valid JSON in this exact format:
+{
+  "decision_summary": "<one sentence: what decision needs to be made>",
+  "recommended_option": "<Option A|Option B|other label>",
+  "recommendation": "<2-3 sentences: why this is the right choice>",
+  "confidence": <integer 0-100>,
+  "caveats": "<any important conditions or risks — empty string if none>"
+}
+
+Be direct. Pick one option. Do not hedge with "it depends" unless the codebase truly has blocking unknowns.
+"""
+
+
+@main.command()
+@click.option("--limit", "-n", default=10, help="Max projects to triage (default: 10)")
+@click.option("--imessage", "-i", is_flag=True, help="Send recommendations via iMessage")
+@click.option("--dry-run", is_flag=True, help="Show which projects would be triaged without running")
+@click.option("--timeout", default=120, help="Seconds per assessment (default: 120)")
+def triage(limit: int, imessage: bool, dry_run: bool, timeout: int):
+    """Assess projects with pending decisions and recommend an option.
+
+    Finds all projects where has_pending_decision=True, runs a read-only
+    Claude assessment for each, and outputs a recommendation. Optionally
+    sends recommendations via iMessage.
+
+    Example:
+        pm triage              # Show recommendations in terminal
+        pm triage --imessage   # Send each recommendation via iMessage
+    """
+    import json as _json
+    import re as _re
+
+    init_db()
+    session = get_session()
+    projects = (
+        session.query(Project)
+        .filter(
+            Project.has_pending_decision == True,
+            Project.archived == False,
+        )
+        .order_by(Project.priority.asc(), Project.name.asc())
+        .limit(limit)
+        .all()
+    )
+    session.close()
+
+    if not projects:
+        console.print("[dim]No projects with pending decisions.[/dim]")
+        return
+
+    console.print(f"[bold]Pending Decisions: {len(projects)} project(s)[/bold]\n")
+
+    if dry_run:
+        for p in projects:
+            console.print(f"  [cyan]•[/cyan] {p.name}  [dim]{p.path}[/dim]")
+        return
+
+    for project in projects:
+        console.print(f"[bold blue]Triaging: {project.name}[/bold blue]")
+
+        user_prompt = (
+            f"This project has a pending decision that needs resolution.\n"
+            f"Project: {project.name}\n"
+            f"Path: {project.path}\n\n"
+            f"Read CLAUDE.md, TODO.md, PROGRESS.md to find the pending decision(s).\n"
+            f"Return ONLY the JSON recommendation."
+        )
+
+        cmd = [
+            "claude",
+            "--dangerously-skip-permissions",
+            "--max-budget-usd", "0.25",
+            "--allowedTools", "Read,Glob,Grep",
+            "--system-prompt", _TRIAGE_SYSTEM_PROMPT,
+            "-p", user_prompt,
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=timeout, cwd=project.path,
+            )
+            raw = result.stdout.strip()
+
+            # Extract JSON
+            json_match = _re.search(r'\{.*?"confidence".*?\}', raw, _re.DOTALL)
+            if json_match:
+                data = _json.loads(json_match.group(0))
+                decision = data.get("decision_summary", "Unknown decision")
+                option = data.get("recommended_option", "?")
+                reasoning = data.get("recommendation", "")
+                confidence = data.get("confidence", 0)
+                caveats = data.get("caveats", "")
+
+                color = "green" if confidence >= 70 else "yellow" if confidence >= 50 else "red"
+                console.print(f"  Decision: [bold]{decision}[/bold]")
+                console.print(f"  Recommend: [bold]{option}[/bold]  "
+                              f"Confidence: [{color}]{confidence}%[/{color}]")
+                console.print(f"  Reasoning: {reasoning}")
+                if caveats:
+                    console.print(f"  [dim]Caveats: {caveats}[/dim]")
+
+                if imessage:
+                    msg = (
+                        f"🔀 Decision Needed: {project.name}\n"
+                        f"Decision: {decision}\n"
+                        f"Recommendation: {option} ({confidence}% confidence)\n"
+                        f"{reasoning}"
+                    )
+                    if caveats:
+                        msg += f"\nCaveats: {caveats}"
+                    try:
+                        _send_imessage_triage(msg)
+                        console.print("  [dim]→ Sent via iMessage[/dim]")
+                    except Exception as e:
+                        console.print(f"  [yellow]iMessage failed: {e}[/yellow]")
+            else:
+                console.print(f"  [yellow]Could not parse recommendation[/yellow]")
+                console.print(f"  [dim]{raw[:200]}[/dim]")
+
+        except subprocess.TimeoutExpired:
+            console.print(f"  [red]Timed out after {timeout}s[/red]")
+        except FileNotFoundError:
+            console.print(f"  [red]claude CLI not found[/red]")
+            break
+        except Exception as e:
+            console.print(f"  [red]Error: {e}[/red]")
+
+        console.print()
+
+
+def _send_imessage_triage(message: str, phone: str = "+12064962555") -> None:
+    """Send a triage recommendation via iMessage."""
+    import subprocess as _sp
+    script = f'''
+tell application "Messages"
+    set targetBuddy to "{phone}"
+    set targetService to (1st account whose service type = iMessage)
+    set targetBuddy to participant targetBuddy of targetService
+    send "{message}" to targetBuddy
+end tell
+'''
+    subprocess.run(["osascript", "-e", script], check=True, capture_output=True)
+
+
+# ── Scheduling (launchd) ─────────────────────────────────────────────────────
+
+_SCHEDULE_LABEL = "com.pm.agent-batch"
+_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{_SCHEDULE_LABEL}.plist"
+_PM_BIN = Path(__file__).parent.parent / "venv" / "bin" / "pm"
+_LOG_DIR = Path(__file__).parent.parent / "logs"
+
+
+def _build_plist(hour: int, limit: int, budget: float, workers: int, dry_run: bool) -> str:
+    """Generate the launchd plist XML for nightly agent batch."""
+    dry_flag = "        <string>--dry-run</string>\n" if dry_run else ""
+    return f"""\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{_SCHEDULE_LABEL}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{_PM_BIN}</string>
+        <string>agent</string>
+        <string>batch</string>
+        <string>--limit</string>
+        <string>{limit}</string>
+        <string>--budget</string>
+        <string>{budget}</string>
+        <string>--workers</string>
+        <string>{workers}</string>
+{dry_flag}    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>{hour}</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>{_LOG_DIR}/agent-batch.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{_LOG_DIR}/agent-batch-error.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
+"""
+
+
+@main.group()
+def schedule():
+    """Manage scheduled agent batch runs (macOS launchd)."""
+    pass
+
+
+@schedule.command("install")
+@click.option("--hour", default=2, help="Hour to run (24h, default: 2am)")
+@click.option("--limit", default=5, help="Max projects per run (default: 5)")
+@click.option("--budget", default=1.00, help="Budget per project USD (default: 1.00)")
+@click.option("--workers", default=3, help="Parallel workers (default: 3)")
+@click.option("--dry-run-agent", is_flag=True, help="Schedule in dry-run mode (assess only)")
+def schedule_install(hour: int, limit: int, budget: float, workers: int, dry_run_agent: bool):
+    """Install nightly agent batch launchd job."""
+    import platform
+    if platform.system() != "Darwin":
+        console.print("[red]schedule only supported on macOS (launchd)[/red]")
+        raise SystemExit(1)
+
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    plist_content = _build_plist(hour, limit, budget, workers, dry_run_agent)
+
+    _PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _PLIST_PATH.write_text(plist_content)
+
+    # Load into launchd
+    try:
+        subprocess.run(
+            ["launchctl", "load", str(_PLIST_PATH)],
+            check=True, capture_output=True,
+        )
+        console.print(f"[green]Installed and loaded: {_SCHEDULE_LABEL}[/green]")
+        console.print(f"  Runs: daily at {hour:02d}:00, up to {limit} projects, ${budget}/project")
+        console.print(f"  Logs: {_LOG_DIR}/agent-batch.log")
+        console.print(f"  Plist: {_PLIST_PATH}")
+    except subprocess.CalledProcessError as e:
+        console.print(f"[yellow]Plist written but launchctl load failed:[/yellow] {e.stderr.decode()}")
+        console.print(f"  Run manually: launchctl load {_PLIST_PATH}")
+
+
+@schedule.command("uninstall")
+def schedule_uninstall():
+    """Remove nightly agent batch launchd job."""
+    import platform
+    if platform.system() != "Darwin":
+        console.print("[red]schedule only supported on macOS (launchd)[/red]")
+        raise SystemExit(1)
+
+    if not _PLIST_PATH.exists():
+        console.print(f"[dim]Not installed ({_PLIST_PATH})[/dim]")
+        return
+
+    try:
+        subprocess.run(
+            ["launchctl", "unload", str(_PLIST_PATH)],
+            check=True, capture_output=True,
+        )
+    except subprocess.CalledProcessError:
+        pass  # May not be loaded; proceed to delete
+
+    _PLIST_PATH.unlink(missing_ok=True)
+    console.print(f"[green]Uninstalled: {_SCHEDULE_LABEL}[/green]")
+
+
+@schedule.command("status")
+def schedule_status():
+    """Show current schedule status."""
+    if not _PLIST_PATH.exists():
+        console.print(f"[dim]Not installed. Run: pm schedule install[/dim]")
+        return
+
+    console.print(f"[bold]Schedule: {_SCHEDULE_LABEL}[/bold]")
+    console.print(f"  Plist: {_PLIST_PATH}")
+
+    # Check if loaded in launchd
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", _SCHEDULE_LABEL],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            console.print("  Status: [green]loaded[/green]")
+        else:
+            console.print("  Status: [yellow]plist exists but not loaded[/yellow]")
+            console.print(f"  Load with: launchctl load {_PLIST_PATH}")
+    except FileNotFoundError:
+        console.print("  [dim](launchctl not available)[/dim]")
+
+    # Show log tail if exists
+    log_file = _LOG_DIR / "agent-batch.log"
+    if log_file.exists():
+        lines = log_file.read_text().splitlines()
+        if lines:
+            console.print(f"\n[dim]Last log entry ({log_file}):[/dim]")
+            console.print(f"  {lines[-1]}")
+
+
+# ── Garbage Collection ───────────────────────────────────────────────────────
+
+
+@main.command()
+@click.option("--dry-run", is_flag=True, help="Show what would be removed without deleting")
+def gc(dry_run: bool):
+    """Remove DB records for projects that no longer exist on disk."""
+    session = get_session()
+    projects = session.query(Project).all()
+
+    removed = []
+    for project in projects:
+        if not Path(project.path).exists():
+            removed.append(project)
+
+    if not removed:
+        console.print("[dim]No stale records found.[/dim]")
+        session.close()
+        return
+
+    table = Table("Name", "Path", "Last Scanned")
+    for p in removed:
+        scanned = p.last_scanned.strftime("%Y-%m-%d") if p.last_scanned else "never"
+        table.add_row(p.name, p.path, scanned)
+
+    console.print(table)
+
+    if dry_run:
+        console.print(f"\n[yellow]Dry run: {len(removed)} record(s) would be removed.[/yellow]")
+    else:
+        for p in removed:
+            session.delete(p)
+        session.commit()
+        console.print(f"\n[green]Removed {len(removed)} stale record(s).[/green]")
+
+    session.close()
 
 
 if __name__ == "__main__":

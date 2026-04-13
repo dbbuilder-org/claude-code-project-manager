@@ -18,6 +18,10 @@ ENV/
 data/*.db
 *.db
 
+# Runtime artifacts
+transcripts/
+logs/
+
 # OS
 .DS_Store
 Thumbs.db

@@ -81,7 +81,7 @@ def parse_pm_status(content: str, source_file: str = None) -> ProjectMetadata:
             if ':' in line:
                 key, value = line.split(':', 1)
                 key = key.strip().lower()
-                value = value.strip()
+                value = value.split('#')[0].strip()  # Strip inline comments
 
                 if key == 'priority':
                     try:
@@ -138,8 +138,9 @@ def write_pm_status(project_path: Path, metadata: ProjectMetadata) -> bool:
     lines = ['---']
 
     # Priority
-    priority_labels = {1: 'critical', 2: 'high', 3: 'normal', 4: 'low', 5: 'someday'}
-    lines.append(f"priority: {metadata.priority}  # {priority_labels.get(metadata.priority, 'normal')}")
+    from pm.database.models import PRIORITY_LABELS as _PL
+    _priority_label = _PL.get(metadata.priority, "Normal").lower()
+    lines.append(f"priority: {metadata.priority}  # {_priority_label}")
 
     # Deadline
     if metadata.deadline:
@@ -183,11 +184,34 @@ def write_pm_status(project_path: Path, metadata: ProjectMetadata) -> bool:
 
     content = '\n'.join(lines)
 
+    import os as _os
+    tmp = status_file.with_suffix('.tmp')
     try:
-        status_file.write_text(content)
+        tmp.write_text(content)
+        _os.replace(tmp, status_file)
         return True
-    except Exception as e:
+    except Exception:
+        tmp.unlink(missing_ok=True)
         return False
+
+
+def sync_project_to_file(project) -> bool:
+    """Sync all PM metadata fields from a Project ORM object to PM-STATUS.md.
+
+    Convenience wrapper so both CLI and dashboard don't duplicate this logic.
+    """
+    meta = ProjectMetadata(
+        priority=project.priority or 3,
+        deadline=project.deadline,
+        target_date=project.target_date,
+        tags=project.tags_list,
+        client_name=project.client_name,
+        budget_hours=project.budget_hours,
+        hours_logged=project.hours_logged or 0,
+        archived=project.archived or False,
+        notes=project.notes or "",
+    )
+    return write_pm_status(Path(project.path), meta)
 
 
 def sync_to_file(project_path: Path, **kwargs) -> bool:
