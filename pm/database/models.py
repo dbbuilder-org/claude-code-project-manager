@@ -1,6 +1,7 @@
 """SQLAlchemy models for project tracking."""
 
 import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -450,3 +451,23 @@ def get_session() -> Session:
         init_db()
 
     return _SessionLocal()
+
+
+@contextmanager
+def db_session():
+    """Context manager that provides a session and guarantees close + rollback on error.
+
+    Usage::
+
+        with db_session() as session:
+            project = session.query(Project).filter_by(name="foo").first()
+            session.commit()
+    """
+    session = get_session()
+    try:
+        yield session
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()

@@ -19,7 +19,7 @@ from rich import box
 from .scanner.detector import ProjectDetector, ProjectInfo
 from .scanner.parser import ProgressParser, ProjectProgress, ItemStatus
 from .generator.prompts import ContinuePromptGenerator, PromptMode
-from .database.models import init_db, get_session, Project, ProgressItem, ScanHistory
+from .database.models import init_db, get_session, db_session, Project, ProgressItem, ScanHistory
 from .metadata import read_pm_status, sync_to_file, sync_project_to_file, PM_STATUS_FILENAME
 from .digest import week_to_date_range, digest_by_project, digest_by_day
 from .brief import build_brief, format_brief_text, format_brief_imessage
@@ -111,107 +111,106 @@ def scan(base_path: str, verbose: bool):
         progress.update(task, description=f"Found {len(projects)} projects")
 
         # Process each project
-        session = get_session()
-        stats = {"new": 0, "updated": 0, "client": 0, "internal": 0, "tool": 0}
+        with db_session() as session:
+            stats = {"new": 0, "updated": 0, "client": 0, "internal": 0, "tool": 0}
 
-        for proj_info in projects:
-            progress.update(task, description=f"Processing {proj_info.name}...")
+            for proj_info in projects:
+                progress.update(task, description=f"Processing {proj_info.name}...")
 
-            # Parse progress
-            proj_progress = parser.parse_project(proj_info.path)
+                # Parse progress
+                proj_progress = parser.parse_project(proj_info.path)
 
-            # Update database
-            proj_id = str(proj_info.path)
-            existing = session.query(Project).filter_by(id=proj_id).first()
+                # Update database
+                proj_id = str(proj_info.path)
+                existing = session.query(Project).filter_by(id=proj_id).first()
 
-            if existing:
-                stats["updated"] += 1
-                proj = existing
-            else:
-                stats["new"] += 1
-                proj = Project(id=proj_id)
-                session.add(proj)
+                if existing:
+                    stats["updated"] += 1
+                    proj = existing
+                else:
+                    stats["new"] += 1
+                    proj = Project(id=proj_id)
+                    session.add(proj)
 
-            # Update project fields
-            proj.path = str(proj_info.path)
-            proj.name = proj_info.name
-            proj.project_type = proj_info.project_type
-            proj.category = proj_info.category
-            proj.last_scanned = datetime.now(timezone.utc).replace(tzinfo=None)
+                # Update project fields
+                proj.path = str(proj_info.path)
+                proj.name = proj_info.name
+                proj.project_type = proj_info.project_type
+                proj.category = proj_info.category
+                proj.last_scanned = datetime.now(timezone.utc).replace(tzinfo=None)
 
-            # Progress state
-            proj.completion_pct = proj_progress.completion_pct
-            proj.current_phase = proj_progress.current_phase
-            proj.current_status = proj_progress.current_status
-            proj.current_focus = proj_progress.current_focus
-            proj.next_action = proj_progress.next_action
-            proj.has_pending_decision = proj_progress.has_pending_decision
+                # Progress state
+                proj.completion_pct = proj_progress.completion_pct
+                proj.current_phase = proj_progress.current_phase
+                proj.current_status = proj_progress.current_status
+                proj.current_focus = proj_progress.current_focus
+                proj.next_action = proj_progress.next_action
+                proj.has_pending_decision = proj_progress.has_pending_decision
 
-            # Git state
-            proj.git_branch = proj_info.git_branch
-            proj.git_dirty = proj_info.git_dirty
-            proj.last_commit_date = proj_info.last_commit_date
-            proj.last_commit_msg = proj_info.last_commit_msg
-            proj.last_activity = proj_info.last_commit_date
+                # Git state
+                proj.git_branch = proj_info.git_branch
+                proj.git_dirty = proj_info.git_dirty
+                proj.last_commit_date = proj_info.last_commit_date
+                proj.last_commit_msg = proj_info.last_commit_msg
+                proj.last_activity = proj_info.last_commit_date
 
-            # Files
-            proj.has_claude_md = proj_info.has_claude_md
-            proj.has_readme = proj_info.has_readme
-            proj.has_todo = proj_info.has_todo
-            proj.has_progress = proj_info.has_progress
-            proj.progress_files = json.dumps(proj_info.progress_files)
+                # Files
+                proj.has_claude_md = proj_info.has_claude_md
+                proj.has_readme = proj_info.has_readme
+                proj.has_todo = proj_info.has_todo
+                proj.has_progress = proj_info.has_progress
+                proj.progress_files = json.dumps(proj_info.progress_files)
 
-            # Read PM-STATUS.md metadata (if exists)
-            pm_meta = read_pm_status(proj_info.path)
-            if pm_meta:
-                # Only update if values are set in file (don't overwrite with defaults)
-                if pm_meta.priority != 3:  # Non-default priority
-                    proj.priority = pm_meta.priority
-                if pm_meta.deadline:
-                    proj.deadline = pm_meta.deadline
-                if pm_meta.target_date:
-                    proj.target_date = pm_meta.target_date
-                if pm_meta.tags:
-                    proj.tags = json.dumps(pm_meta.tags)
-                if pm_meta.client_name:
-                    proj.client_name = pm_meta.client_name
-                if pm_meta.budget_hours:
-                    proj.budget_hours = pm_meta.budget_hours
-                if pm_meta.hours_logged:
-                    proj.hours_logged = pm_meta.hours_logged
-                if pm_meta.archived:
-                    proj.archived = pm_meta.archived
-                if pm_meta.notes:
-                    proj.notes = pm_meta.notes
+                # Read PM-STATUS.md metadata (if exists)
+                pm_meta = read_pm_status(proj_info.path)
+                if pm_meta:
+                    # Only update if values are set in file (don't overwrite with defaults)
+                    if pm_meta.priority != 3:  # Non-default priority
+                        proj.priority = pm_meta.priority
+                    if pm_meta.deadline:
+                        proj.deadline = pm_meta.deadline
+                    if pm_meta.target_date:
+                        proj.target_date = pm_meta.target_date
+                    if pm_meta.tags:
+                        proj.tags = json.dumps(pm_meta.tags)
+                    if pm_meta.client_name:
+                        proj.client_name = pm_meta.client_name
+                    if pm_meta.budget_hours:
+                        proj.budget_hours = pm_meta.budget_hours
+                    if pm_meta.hours_logged:
+                        proj.hours_logged = pm_meta.hours_logged
+                    if pm_meta.archived:
+                        proj.archived = pm_meta.archived
+                    if pm_meta.notes:
+                        proj.notes = pm_meta.notes
 
-            # Track category stats
-            stats[proj_info.category] = stats.get(proj_info.category, 0) + 1
+                # Track category stats
+                stats[proj_info.category] = stats.get(proj_info.category, 0) + 1
 
-            # Update progress items
-            session.query(ProgressItem).filter_by(project_id=proj_id).delete()
-            for item in proj_progress.items[:50]:  # Limit items
-                session.add(ProgressItem(
+                # Update progress items
+                session.query(ProgressItem).filter_by(project_id=proj_id).delete()
+                for item in proj_progress.items[:50]:  # Limit items
+                    session.add(ProgressItem(
+                        project_id=proj_id,
+                        item_type=item.item_type,
+                        content=item.content,
+                        status=item.status.value,
+                        priority=item.priority.value if item.priority else None,
+                        source_file=item.source_file,
+                        line_number=item.line_number,
+                    ))
+
+                # Add history entry
+                session.add(ScanHistory(
                     project_id=proj_id,
-                    item_type=item.item_type,
-                    content=item.content,
-                    status=item.status.value,
-                    priority=item.priority.value if item.priority else None,
-                    source_file=item.source_file,
-                    line_number=item.line_number,
+                    completion_pct=proj_progress.completion_pct,
+                    items_total=len(proj_progress.items),
+                    items_complete=sum(1 for i in proj_progress.items if i.status == ItemStatus.COMPLETE),
+                    items_in_progress=sum(1 for i in proj_progress.items if i.status == ItemStatus.IN_PROGRESS),
+                    items_pending=sum(1 for i in proj_progress.items if i.status == ItemStatus.PENDING),
                 ))
 
-            # Add history entry
-            session.add(ScanHistory(
-                project_id=proj_id,
-                completion_pct=proj_progress.completion_pct,
-                items_total=len(proj_progress.items),
-                items_complete=sum(1 for i in proj_progress.items if i.status == ItemStatus.COMPLETE),
-                items_in_progress=sum(1 for i in proj_progress.items if i.status == ItemStatus.IN_PROGRESS),
-                items_pending=sum(1 for i in proj_progress.items if i.status == ItemStatus.PENDING),
-            ))
-
-        session.commit()
-        session.close()
+            session.commit()
 
     # Print summary
     console.print()
@@ -235,24 +234,24 @@ def scan(base_path: str, verbose: bool):
 def status(filter_str: Optional[str], sort: str, limit: int, as_json: bool):
     """Show project status summary."""
     init_db()
-    session = get_session()
+    with db_session() as session:
 
-    # Build query
-    query = session.query(Project)
+        # Build query
+        query = session.query(Project)
 
-    query = apply_project_filter(query, filter_str)
+        query = apply_project_filter(query, filter_str)
 
-    # Apply sort
-    if sort == "completion":
-        query = query.order_by(Project.completion_pct.desc().nullslast())
-    elif sort == "activity":
-        query = query.order_by(Project.last_activity.desc().nullslast())
-    else:
-        query = query.order_by(Project.name)
+        # Apply sort
+        if sort == "completion":
+            query = query.order_by(Project.completion_pct.desc().nullslast())
+        elif sort == "activity":
+            query = query.order_by(Project.last_activity.desc().nullslast())
+        else:
+            query = query.order_by(Project.name)
 
-    if limit > 0:
-        query = query.limit(limit)
-    projects = query.all()
+        if limit > 0:
+            query = query.limit(limit)
+        projects = query.all()
 
     if as_json:
         data = [{
@@ -299,6 +298,8 @@ def status(filter_str: Optional[str], sort: str, limit: int, as_json: bool):
             flags.append("●")
         if p.has_claude_md:
             flags.append("📄")
+        if p.has_readme:
+            flags.append("📖")
 
         # Phase/Status
         phase = p.current_phase or p.current_status or "[dim]—[/dim]"
@@ -336,8 +337,6 @@ def status(filter_str: Optional[str], sort: str, limit: int, as_json: bool):
                   f"Pending decisions: {with_decisions} | "
                   f"Uncommitted changes: {dirty}[/dim]")
 
-    session.close()
-
 
 @main.command("continue")
 @click.argument("project_name", required=False)
@@ -354,32 +353,30 @@ def continue_project(
 ):
     """Generate and optionally run continue command for a project."""
     init_db()
-    session = get_session()
     parser = ProgressParser()
     generator = ContinuePromptGenerator()
 
     prompt_mode = PromptMode(mode)
 
     # Find project(s)
-    if project_name:
-        proj = session.query(Project).filter(
-            Project.name.ilike(f"%{project_name}%")
-        ).first()
+    with db_session() as session:
+        if project_name:
+            proj = session.query(Project).filter(
+                Project.name.ilike(f"%{project_name}%")
+            ).first()
 
-        if not proj:
-            console.print(f"[red]Project not found:[/red] {project_name}")
+            if not proj:
+                console.print(f"[red]Project not found:[/red] {project_name}")
+                return
+
+            projects = [proj]
+        elif filter_str:
+            query = session.query(Project)
+            query = apply_project_filter(query, filter_str)
+            projects = query.limit(10).all()
+        else:
+            console.print("[yellow]Specify project name or --filter[/yellow]")
             return
-
-        projects = [proj]
-    elif filter_str:
-        query = session.query(Project)
-        if filter_str.startswith("type:"):
-            category = filter_str.split(":")[1]
-            query = query.filter(Project.category == category)
-        projects = query.limit(10).all()
-    else:
-        console.print("[yellow]Specify project name or --filter[/yellow]")
-        return
 
     # Generate prompts
     for proj in projects:
@@ -422,8 +419,6 @@ def continue_project(
             )
             console.print(f"[green]✓[/green] Launched {used.value} for {proj.name}")
 
-    session.close()
-
 
 
 @main.command()
@@ -438,31 +433,31 @@ def dashboard(port: int):
         return
 
     console.print(f"[bold blue]Launching dashboard[/bold blue] on port {port}")
-    subprocess.run([sys.executable, "-m", "streamlit", "run", str(dashboard_path), "--server.port", str(port)])
+    subprocess.run([sys.executable, "-m", "streamlit", "run", str(dashboard_path),
+                    "--server.port", str(port), "--server.address", "127.0.0.1"])
 
 
 @main.command()
 def summary():
     """Quick summary of all projects."""
     init_db()
-    session = get_session()
+    with db_session() as session:
+        total = session.query(Project).count()
+        clients = session.query(Project).filter_by(category="client").count()
+        internal = session.query(Project).filter_by(category="internal").count()
+        tools = session.query(Project).filter_by(category="tool").count()
 
-    total = session.query(Project).count()
-    clients = session.query(Project).filter_by(category="client").count()
-    internal = session.query(Project).filter_by(category="internal").count()
-    tools = session.query(Project).filter_by(category="tool").count()
+        decisions = session.query(Project).filter_by(has_pending_decision=True).count()
+        dirty = session.query(Project).filter_by(git_dirty=True).count()
 
-    decisions = session.query(Project).filter_by(has_pending_decision=True).count()
-    dirty = session.query(Project).filter_by(git_dirty=True).count()
-
-    # Completion buckets
-    complete = session.query(Project).filter(Project.completion_pct >= 90).count()
-    progress = session.query(Project).filter(
-        Project.completion_pct >= 25,
-        Project.completion_pct < 90
-    ).count()
-    early = session.query(Project).filter(Project.completion_pct < 25).count()
-    unknown = session.query(Project).filter(Project.completion_pct.is_(None)).count()
+        # Completion buckets
+        complete = session.query(Project).filter(Project.completion_pct >= 90).count()
+        progress = session.query(Project).filter(
+            Project.completion_pct >= 25,
+            Project.completion_pct < 90
+        ).count()
+        early = session.query(Project).filter(Project.completion_pct < 25).count()
+        unknown = session.query(Project).filter(Project.completion_pct.is_(None)).count()
 
     console.print(Panel(
         f"[bold]Total Projects:[/bold] {total}\n\n"
@@ -481,8 +476,6 @@ def summary():
         border_style="cyan",
     ))
 
-    session.close()
-
 
 @main.command()
 @click.option("--filter", "-f", "filter_str", help="Filter: type:client, type:internal")
@@ -491,13 +484,12 @@ def summary():
 def health(filter_str: Optional[str], limit: int, asc: bool):
     """Show projects sorted by health score."""
     init_db()
-    session = get_session()
+    with db_session() as session:
+        # Build query
+        query = session.query(Project)
 
-    # Build query
-    query = session.query(Project)
-
-    query = apply_project_filter(query, filter_str)
-    projects = query.all()
+        query = apply_project_filter(query, filter_str)
+        projects = query.all()
 
     # Calculate health scores and sort
     projects_with_health = [(p, p.health_score) for p in projects]
@@ -560,6 +552,8 @@ def health(filter_str: Optional[str], limit: int, asc: bool):
             issues.append("● uncommitted")
         if not p.has_claude_md:
             issues.append("📄 no CLAUDE.md")
+        if not p.has_readme:
+            issues.append("📖 no README")
         if p.project_type == 'generic':
             issues.append("? generic type")
 
@@ -580,8 +574,6 @@ def health(filter_str: Optional[str], limit: int, asc: bool):
     # Summary
     avg_health = sum(h for _, h in projects_with_health) / len(projects_with_health) if projects_with_health else 0
     console.print(f"\n[dim]Average health: {avg_health:.0f}/100[/dim]")
-
-    session.close()
 
 
 @main.command()
@@ -608,120 +600,116 @@ def edit(project_name: str, notes: Optional[str], deadline: Optional[str],
     Use --no-sync to only update the database.
     """
     init_db()
-    session = get_session()
+    with db_session() as session:
 
-    # Find project
-    project = session.query(Project).filter(
-        Project.name.ilike(f"%{project_name}%")
-    ).first()
+        # Find project
+        project = session.query(Project).filter(
+            Project.name.ilike(f"%{project_name}%")
+        ).first()
 
-    if not project:
-        console.print(f"[red]Project '{project_name}' not found[/red]")
-        session.close()
-        return
-
-    # Show current metadata
-    if show or all(x is None for x in [notes, deadline, target, priority, tags, client, budget, hours, archive]):
-        console.print(Panel(f"[bold]{project.name}[/bold]", subtitle=project.path))
-
-        table = Table(box=box.SIMPLE)
-        table.add_column("Field", style="cyan")
-        table.add_column("Value")
-
-        table.add_row("Priority", f"{project.priority_label} ({project.priority})")
-        table.add_row("Deadline", str(project.deadline.date()) if project.deadline else "—")
-        table.add_row("Target Date", str(project.target_date.date()) if project.target_date else "—")
-        table.add_row("Days to Deadline", str(project.days_until_deadline) if project.days_until_deadline else "—")
-        table.add_row("Urgency Score", str(project.urgency_score))
-        table.add_row("Client", project.client_name or "—")
-        table.add_row("Budget Hours", f"{project.budget_hours:.1f}" if project.budget_hours else "—")
-        table.add_row("Hours Logged", f"{project.hours_logged:.1f}" if project.hours_logged else "0")
-        table.add_row("Tags", ", ".join(project.tags_list) if project.tags_list else "—")
-        table.add_row("Archived", "Yes" if project.archived else "No")
-        table.add_row("Notes", project.notes[:100] + "..." if project.notes and len(project.notes) > 100 else (project.notes or "—"))
-
-        # Check for PM-STATUS.md file
-        pm_file = Path(project.path) / PM_STATUS_FILENAME
-        table.add_row("PM-STATUS.md", "[green]exists[/green]" if pm_file.exists() else "[dim]not created[/dim]")
-
-        console.print(table)
-
-        if not any([notes, deadline, target, priority, tags, client, budget, hours, archive is not None]):
-            console.print("\n[dim]Use options to update: --notes, --deadline, --priority, etc.[/dim]")
-            console.print(f"[dim]Changes sync to {PM_STATUS_FILENAME} by default (--no-sync to disable)[/dim]")
-            session.close()
+        if not project:
+            console.print(f"[red]Project '{project_name}' not found[/red]")
             return
 
-    # Update fields
-    updated = []
+        # Show current metadata
+        if show or all(x is None for x in [notes, deadline, target, priority, tags, client, budget, hours, archive]):
+            console.print(Panel(f"[bold]{project.name}[/bold]", subtitle=project.path))
 
-    if notes is not None:
-        project.notes = notes
-        updated.append("notes")
+            table = Table(box=box.SIMPLE)
+            table.add_column("Field", style="cyan")
+            table.add_column("Value")
 
-    if deadline is not None:
-        try:
-            project.deadline = datetime.strptime(deadline, "%Y-%m-%d")
-            updated.append("deadline")
-        except ValueError:
-            console.print(f"[red]Invalid date format: {deadline}. Use YYYY-MM-DD[/red]")
+            table.add_row("Priority", f"{project.priority_label} ({project.priority})")
+            table.add_row("Deadline", str(project.deadline.date()) if project.deadline else "—")
+            table.add_row("Target Date", str(project.target_date.date()) if project.target_date else "—")
+            table.add_row("Days to Deadline", str(project.days_until_deadline) if project.days_until_deadline else "—")
+            table.add_row("Urgency Score", str(project.urgency_score))
+            table.add_row("Client", project.client_name or "—")
+            table.add_row("Budget Hours", f"{project.budget_hours:.1f}" if project.budget_hours else "—")
+            table.add_row("Hours Logged", f"{project.hours_logged:.1f}" if project.hours_logged else "0")
+            table.add_row("Tags", ", ".join(project.tags_list) if project.tags_list else "—")
+            table.add_row("Archived", "Yes" if project.archived else "No")
+            table.add_row("Notes", project.notes[:100] + "..." if project.notes and len(project.notes) > 100 else (project.notes or "—"))
 
-    if target is not None:
-        try:
-            project.target_date = datetime.strptime(target, "%Y-%m-%d")
-            updated.append("target_date")
-        except ValueError:
-            console.print(f"[red]Invalid date format: {target}. Use YYYY-MM-DD[/red]")
+            # Check for PM-STATUS.md file
+            pm_file = Path(project.path) / PM_STATUS_FILENAME
+            table.add_row("PM-STATUS.md", "[green]exists[/green]" if pm_file.exists() else "[dim]not created[/dim]")
 
-    if priority is not None:
-        project.priority = int(priority)
-        updated.append("priority")
+            console.print(table)
 
-    if tags is not None:
-        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
-        project.tags = json.dumps(tag_list)
-        updated.append("tags")
+            if not any([notes, deadline, target, priority, tags, client, budget, hours, archive is not None]):
+                console.print("\n[dim]Use options to update: --notes, --deadline, --priority, etc.[/dim]")
+                console.print(f"[dim]Changes sync to {PM_STATUS_FILENAME} by default (--no-sync to disable)[/dim]")
+                return
 
-    if client is not None:
-        project.client_name = client
-        updated.append("client_name")
+        # Update fields
+        updated = []
 
-    if budget is not None:
-        project.budget_hours = budget
-        updated.append("budget_hours")
+        if notes is not None:
+            project.notes = notes
+            updated.append("notes")
 
-    if hours is not None:
-        project.hours_logged = (project.hours_logged or 0) + hours
-        updated.append(f"hours_logged (+{hours})")
+        if deadline is not None:
+            try:
+                project.deadline = datetime.strptime(deadline, "%Y-%m-%d")
+                updated.append("deadline")
+            except ValueError:
+                console.print(f"[red]Invalid date format: {deadline}. Use YYYY-MM-DD[/red]")
 
-    if archive is not None:
-        project.archived = archive
-        updated.append("archived" if archive else "unarchived")
+        if target is not None:
+            try:
+                project.target_date = datetime.strptime(target, "%Y-%m-%d")
+                updated.append("target_date")
+            except ValueError:
+                console.print(f"[red]Invalid date format: {target}. Use YYYY-MM-DD[/red]")
 
-    if updated:
-        session.commit()
-        console.print(f"[green]✓ Updated {project.name}:[/green] {', '.join(updated)}")
+        if priority is not None:
+            project.priority = int(priority)
+            updated.append("priority")
 
-        # Sync to PM-STATUS.md file
-        if sync:
-            from .metadata import ProjectMetadata
-            meta = ProjectMetadata(
-                priority=project.priority or 3,
-                deadline=project.deadline,
-                target_date=project.target_date,
-                tags=project.tags_list,
-                client_name=project.client_name,
-                budget_hours=project.budget_hours,
-                hours_logged=project.hours_logged or 0,
-                archived=project.archived or False,
-                notes=project.notes or "",
-            )
-            if sync_to_file(Path(project.path), **vars(meta)):
-                console.print(f"[green]✓ Synced to[/green] {PM_STATUS_FILENAME}")
-            else:
-                console.print(f"[yellow]⚠ Could not write {PM_STATUS_FILENAME}[/yellow]")
+        if tags is not None:
+            tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+            project.tags = json.dumps(tag_list)
+            updated.append("tags")
 
-    session.close()
+        if client is not None:
+            project.client_name = client
+            updated.append("client_name")
+
+        if budget is not None:
+            project.budget_hours = budget
+            updated.append("budget_hours")
+
+        if hours is not None:
+            project.hours_logged = (project.hours_logged or 0) + hours
+            updated.append(f"hours_logged (+{hours})")
+
+        if archive is not None:
+            project.archived = archive
+            updated.append("archived" if archive else "unarchived")
+
+        if updated:
+            session.commit()
+            console.print(f"[green]✓ Updated {project.name}:[/green] {', '.join(updated)}")
+
+            # Sync to PM-STATUS.md file
+            if sync:
+                from .metadata import ProjectMetadata
+                meta = ProjectMetadata(
+                    priority=project.priority or 3,
+                    deadline=project.deadline,
+                    target_date=project.target_date,
+                    tags=project.tags_list,
+                    client_name=project.client_name,
+                    budget_hours=project.budget_hours,
+                    hours_logged=project.hours_logged or 0,
+                    archived=project.archived or False,
+                    notes=project.notes or "",
+                )
+                if sync_to_file(Path(project.path), **vars(meta)):
+                    console.print(f"[green]✓ Synced to[/green] {PM_STATUS_FILENAME}")
+                else:
+                    console.print(f"[yellow]⚠ Could not write {PM_STATUS_FILENAME}[/yellow]")
 
 
 @main.command()
@@ -734,26 +722,23 @@ def someday(project_name: str):
     Use 'pm edit <name> --priority 3' to pull it back to active.
     """
     init_db()
-    session = get_session()
+    with db_session() as session:
+        project = session.query(Project).filter(
+            Project.name.ilike(f"%{project_name}%")
+        ).first()
 
-    project = session.query(Project).filter(
-        Project.name.ilike(f"%{project_name}%")
-    ).first()
+        if not project:
+            console.print(f"[red]No project found matching '{project_name}'[/red]")
+            return
 
-    if not project:
-        console.print(f"[red]No project found matching '{project_name}'[/red]")
-        session.close()
-        return
+        old_label = project.priority_label
+        proj_name = project.name
+        project.priority = 5
+        session.commit()
+        sync_project_to_file(project)
 
-    old_label = project.priority_label
-    project.priority = 5
-    session.commit()
-
-    sync_project_to_file(project)
-
-    console.print(f"[green]Moved '{project.name}' to Someday[/green] (was {old_label})")
-    console.print(f"[dim]View backlog: pm backlog | Restore: pm edit {project.name} --priority 3[/dim]")
-    session.close()
+    console.print(f"[green]Moved '{proj_name}' to Someday[/green] (was {old_label})")
+    console.print(f"[dim]View backlog: pm backlog | Restore: pm edit {proj_name} --priority 3[/dim]")
 
 
 @main.command()
@@ -768,12 +753,11 @@ def urgent(filter_str: Optional[str], limit: int, show_all: bool):
     Use --all to see every project ranked by urgency score.
     """
     init_db()
-    session = get_session()
+    with db_session() as session:
+        query = session.query(Project).filter(Project.archived == False)
 
-    query = session.query(Project).filter(Project.archived == False)
-
-    query = apply_project_filter(query, filter_str)
-    projects = query.all()
+        query = apply_project_filter(query, filter_str)
+        projects = query.all()
 
     # Sort by urgency
     projects_sorted = sorted(projects, key=lambda p: p.urgency_score, reverse=True)
@@ -796,7 +780,6 @@ def urgent(filter_str: Optional[str], limit: int, show_all: bool):
         console.print("[dim]Set a deadline: pm edit <project> --deadline YYYY-MM-DD[/dim]")
         console.print("[dim]Or boost priority: pm edit <project> --priority 1[/dim]")
         console.print("[dim]Use --all to see all projects ranked by urgency score.[/dim]")
-        session.close()
         return
 
     title = "All Projects by Urgency" if show_all else "Urgent Projects (deadlines · priority 1/2 · overdue)"
@@ -852,7 +835,6 @@ def urgent(filter_str: Optional[str], limit: int, show_all: bool):
         )
 
     console.print(table)
-    session.close()
 
 
 @main.command()
@@ -860,21 +842,19 @@ def urgent(filter_str: Optional[str], limit: int, show_all: bool):
 def backlog(limit: int):
     """Show someday/maybe projects (priority 5) and archived."""
     init_db()
-    session = get_session()
+    with db_session() as session:
+        # Someday projects
+        query = session.query(Project).filter(
+            (Project.priority == 5) | (Project.archived == True)
+        ).order_by(Project.name)
 
-    # Someday projects
-    query = session.query(Project).filter(
-        (Project.priority == 5) | (Project.archived == True)
-    ).order_by(Project.name)
+        if limit > 0:
+            query = query.limit(limit)
 
-    if limit > 0:
-        query = query.limit(limit)
-
-    projects = query.all()
+        projects = query.all()
 
     if not projects:
         console.print("[green]No backlog projects[/green]")
-        session.close()
         return
 
     table = Table(title="Backlog / Someday Projects", box=box.SIMPLE)
@@ -893,7 +873,6 @@ def backlog(limit: int):
 
     console.print(table)
     console.print(f"\n[dim]Total: {len(projects)} projects in backlog[/dim]")
-    session.close()
 
 
 # ── Tags ────────────────────────────────────────────────────────────────────
@@ -909,17 +888,15 @@ def tags():
 def tags_list():
     """List all tags with project counts."""
     init_db()
-    session = get_session()
-
-    projects = session.query(Project).filter(Project.tags.isnot(None)).all()
-    tag_counts: dict[str, int] = {}
-    for p in projects:
-        for t in p.tags_list:
-            tag_counts[t] = tag_counts.get(t, 0) + 1
+    with db_session() as session:
+        projects = session.query(Project).filter(Project.tags.isnot(None)).all()
+        tag_counts: dict[str, int] = {}
+        for p in projects:
+            for t in p.tags_list:
+                tag_counts[t] = tag_counts.get(t, 0) + 1
 
     if not tag_counts:
         console.print("[dim]No tags found across any projects[/dim]")
-        session.close()
         return
 
     table = Table(title="Tags", box=box.SIMPLE)
@@ -931,7 +908,6 @@ def tags_list():
 
     console.print(table)
     console.print(f"\n[dim]{len(tag_counts)} unique tags across {sum(tag_counts.values())} assignments[/dim]")
-    session.close()
 
 
 @tags.command("add")
@@ -941,23 +917,19 @@ def tags_list():
 def tags_add(project_name: str, tag: str, sync: bool):
     """Add a tag to a project."""
     init_db()
-    session = get_session()
+    with db_session() as session:
+        project = session.query(Project).filter(Project.name.ilike(f"%{project_name}%")).first()
+        if not project:
+            console.print(f"[red]Project '{project_name}' not found[/red]")
+            return
 
-    project = session.query(Project).filter(Project.name.ilike(f"%{project_name}%")).first()
-    if not project:
-        console.print(f"[red]Project '{project_name}' not found[/red]")
-        session.close()
-        return
-
-    project.add_tag(tag)
-    session.commit()
-    console.print(f"[green]✓ Added tag '{tag}' to {project.name}[/green]")
-    console.print(f"  Tags: {', '.join(project.tags_list)}")
+        project.add_tag(tag)
+        session.commit()
+        console.print(f"[green]✓ Added tag '{tag}' to {project.name}[/green]")
+        console.print(f"  Tags: {', '.join(project.tags_list)}")
 
     if sync:
         _sync_project(project)
-
-    session.close()
 
 
 @tags.command("remove")
@@ -967,28 +939,23 @@ def tags_add(project_name: str, tag: str, sync: bool):
 def tags_remove(project_name: str, tag: str, sync: bool):
     """Remove a tag from a project."""
     init_db()
-    session = get_session()
+    with db_session() as session:
+        project = session.query(Project).filter(Project.name.ilike(f"%{project_name}%")).first()
+        if not project:
+            console.print(f"[red]Project '{project_name}' not found[/red]")
+            return
 
-    project = session.query(Project).filter(Project.name.ilike(f"%{project_name}%")).first()
-    if not project:
-        console.print(f"[red]Project '{project_name}' not found[/red]")
-        session.close()
-        return
+        if tag not in project.tags_list:
+            console.print(f"[yellow]Tag '{tag}' not on {project.name}[/yellow]")
+            return
 
-    if tag not in project.tags_list:
-        console.print(f"[yellow]Tag '{tag}' not on {project.name}[/yellow]")
-        session.close()
-        return
-
-    project.remove_tag(tag)
-    session.commit()
-    console.print(f"[green]✓ Removed tag '{tag}' from {project.name}[/green]")
-    console.print(f"  Tags: {', '.join(project.tags_list) or '(none)'}")
+        project.remove_tag(tag)
+        session.commit()
+        console.print(f"[green]✓ Removed tag '{tag}' from {project.name}[/green]")
+        console.print(f"  Tags: {', '.join(project.tags_list) or '(none)'}")
 
     if sync:
         _sync_project(project)
-
-    session.close()
 
 
 @tags.command("bulk")
@@ -1004,40 +971,36 @@ def tags_bulk(tag: str, project_names: tuple, filter_str: Optional[str], sync: b
         pm tags bulk client-work --filter type:client
     """
     init_db()
-    session = get_session()
+    with db_session() as session:
+        if project_names:
+            projects = []
+            for name in project_names:
+                p = session.query(Project).filter(Project.name.ilike(f"%{name}%")).first()
+                if p:
+                    projects.append(p)
+                else:
+                    console.print(f"[yellow]Not found: {name}[/yellow]")
+        elif filter_str:
+            query = apply_project_filter(session.query(Project), filter_str)
+            projects = query.all()
+        else:
+            console.print("[yellow]Specify project names or --filter[/yellow]")
+            return
 
-    if project_names:
-        projects = []
-        for name in project_names:
-            p = session.query(Project).filter(Project.name.ilike(f"%{name}%")).first()
-            if p:
-                projects.append(p)
-            else:
-                console.print(f"[yellow]Not found: {name}[/yellow]")
-    elif filter_str:
-        query = apply_project_filter(session.query(Project), filter_str)
-        projects = query.all()
-    else:
-        console.print("[yellow]Specify project names or --filter[/yellow]")
-        session.close()
-        return
+        if not projects:
+            console.print("[red]No projects found[/red]")
+            return
 
-    if not projects:
-        console.print("[red]No projects found[/red]")
-        session.close()
-        return
+        count = 0
+        for p in projects:
+            if tag not in p.tags_list:
+                p.add_tag(tag)
+                count += 1
+                if sync:
+                    _sync_project(p)
 
-    count = 0
-    for p in projects:
-        if tag not in p.tags_list:
-            p.add_tag(tag)
-            count += 1
-            if sync:
-                _sync_project(p)
-
-    session.commit()
-    console.print(f"[green]✓ Applied tag '{tag}' to {count} project(s)[/green]")
-    session.close()
+        session.commit()
+        console.print(f"[green]✓ Applied tag '{tag}' to {count} project(s)[/green]")
 
 
 def _sync_project(project: Project) -> None:
@@ -1069,86 +1032,82 @@ def digest(start_str: Optional[str], end_str: Optional[str], by_day: bool, clien
     """
 
     init_db()
-    session = get_session()
+    with db_session() as session:
 
-    # Parse date range
-    default_start, default_end = week_to_date_range()
-    start_dt = datetime.strptime(start_str, "%Y-%m-%d") if start_str else default_start
-    end_dt = datetime.combine(datetime.strptime(end_str, "%Y-%m-%d").date(), datetime.max.time()) if end_str else default_end
+        # Parse date range
+        default_start, default_end = week_to_date_range()
+        start_dt = datetime.strptime(start_str, "%Y-%m-%d") if start_str else default_start
+        end_dt = datetime.combine(datetime.strptime(end_str, "%Y-%m-%d").date(), datetime.max.time()) if end_str else default_end
 
-    range_label = f"{start_dt.strftime('%b %d')} – {end_dt.strftime('%b %d, %Y')}"
+        range_label = f"{start_dt.strftime('%b %d')} – {end_dt.strftime('%b %d, %Y')}"
 
-    if by_day:
-        results = digest_by_day(session, start_dt, end_dt)
-        if not results:
-            console.print(f"[dim]No activity found for {range_label}[/dim]")
-            session.close()
-            return
+        if by_day:
+            results = digest_by_day(session, start_dt, end_dt)
+            if not results:
+                console.print(f"[dim]No activity found for {range_label}[/dim]")
+                return
 
-        table = Table(title=f"Activity by Day — {range_label}", box=box.SIMPLE)
-        table.add_column("Date")
-        table.add_column("Day")
-        table.add_column("#", justify="right")
-        table.add_column("Projects")
+            table = Table(title=f"Activity by Day — {range_label}", box=box.SIMPLE)
+            table.add_column("Date")
+            table.add_column("Day")
+            table.add_column("#", justify="right")
+            table.add_column("Projects")
 
-        for r in results:
-            table.add_row(
-                r["date"].strftime("%Y-%m-%d"),
-                r["day_name"],
-                str(r["project_count"]),
-                ", ".join(r["project_names"][:10]) + ("..." if len(r["project_names"]) > 10 else ""),
-            )
+            for r in results:
+                table.add_row(
+                    r["date"].strftime("%Y-%m-%d"),
+                    r["day_name"],
+                    str(r["project_count"]),
+                    ", ".join(r["project_names"][:10]) + ("..." if len(r["project_names"]) > 10 else ""),
+                )
 
-        console.print(table)
-        total_projects = len(set(n for r in results for n in r["project_names"]))
-        console.print(f"\n[dim]{len(results)} active days, {total_projects} unique projects[/dim]")
-    else:
-        results = digest_by_project(session, start_dt, end_dt, client_filter=client)
-        if not results:
-            console.print(f"[dim]No activity found for {range_label}[/dim]")
-            session.close()
-            return
+            console.print(table)
+            total_projects = len(set(n for r in results for n in r["project_names"]))
+            console.print(f"\n[dim]{len(results)} active days, {total_projects} unique projects[/dim]")
+        else:
+            results = digest_by_project(session, start_dt, end_dt, client_filter=client)
+            if not results:
+                console.print(f"[dim]No activity found for {range_label}[/dim]")
+                return
 
-        table = Table(title=f"Activity by Project — {range_label}", box=box.SIMPLE)
-        table.add_column("Project")
-        table.add_column("Client")
-        table.add_column("Δ%", justify="right")
-        table.add_column("Current %", justify="right")
-        table.add_column("Last Commit")
-        table.add_column("Status")
-        table.add_column("Health", justify="right")
+            table = Table(title=f"Activity by Project — {range_label}", box=box.SIMPLE)
+            table.add_column("Project")
+            table.add_column("Client")
+            table.add_column("Δ%", justify="right")
+            table.add_column("Current %", justify="right")
+            table.add_column("Last Commit")
+            table.add_column("Status")
+            table.add_column("Health", justify="right")
 
-        current_client = None
-        for r in results:
-            # Visual grouping by client
-            if r["client"] != current_client:
-                current_client = r["client"]
-                if current_client:
-                    table.add_section()
+            current_client = None
+            for r in results:
+                # Visual grouping by client
+                if r["client"] != current_client:
+                    current_client = r["client"]
+                    if current_client:
+                        table.add_section()
 
-            delta_str = f"+{r['completion_delta']:.0f}" if r["completion_delta"] > 0 else f"{r['completion_delta']:.0f}"
-            if r["completion_delta"] > 0:
-                delta_str = f"[green]{delta_str}[/green]"
-            elif r["completion_delta"] < 0:
-                delta_str = f"[red]{delta_str}[/red]"
+                delta_str = f"+{r['completion_delta']:.0f}" if r["completion_delta"] > 0 else f"{r['completion_delta']:.0f}"
+                if r["completion_delta"] > 0:
+                    delta_str = f"[green]{delta_str}[/green]"
+                elif r["completion_delta"] < 0:
+                    delta_str = f"[red]{delta_str}[/red]"
 
-            health = r["health"]
-            h_color = "green" if health >= 70 else ("yellow" if health >= 40 else "red")
+                health = r["health"]
+                h_color = "green" if health >= 70 else ("yellow" if health >= 40 else "red")
 
-            table.add_row(
-                r["name"],
-                r["client"] or "",
-                delta_str,
-                f"{r['current_completion']:.0f}",
-                (r["last_commit_msg"][:40] + "...") if len(r["last_commit_msg"]) > 40 else r["last_commit_msg"],
-                r["current_status"][:20] if r["current_status"] else "",
-                f"[{h_color}]{health}[/{h_color}]",
-            )
+                table.add_row(
+                    r["name"],
+                    r["client"] or "",
+                    delta_str,
+                    f"{r['current_completion']:.0f}",
+                    (r["last_commit_msg"][:40] + "...") if len(r["last_commit_msg"]) > 40 else r["last_commit_msg"],
+                    r["current_status"][:20] if r["current_status"] else "",
+                    f"[{h_color}]{health}[/{h_color}]",
+                )
 
-        console.print(table)
-        console.print(f"\n[dim]{len(results)} projects with activity[/dim]")
-
-    session.close()
+            console.print(table)
+            console.print(f"\n[dim]{len(results)} projects with activity[/dim]")
 
 
 # ── Brief ────────────────────────────────────────────────────────────────────
@@ -1172,10 +1131,8 @@ def brief(days: int, verbose: bool, imessage: bool, only_if_urgent: bool):
     """
 
     init_db()
-    session = get_session()
-
-    brief_data = build_brief(session, lookback_days=days)
-    session.close()
+    with db_session() as session:
+        brief_data = build_brief(session, lookback_days=days)
 
     has_urgent = (
         len(brief_data["deadlines"]) > 0
@@ -1252,52 +1209,48 @@ def stale(days: int, action: bool):
         pm stale --action     # Interactive: pick action for each
     """
     init_db()
-    session = get_session()
+    with db_session() as session:
+        threshold = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+        projects = session.query(Project).filter(
+            (Project.archived == False) | (Project.archived == None),
+            Project.priority != 5,
+            (Project.last_activity < threshold) | (Project.last_activity == None),
+        ).order_by(Project.last_activity.asc().nullsfirst()).all()
 
-    threshold = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
-    projects = session.query(Project).filter(
-        (Project.archived == False) | (Project.archived == None),
-        Project.priority != 5,
-        (Project.last_activity < threshold) | (Project.last_activity == None),
-    ).order_by(Project.last_activity.asc().nullsfirst()).all()
+        if not projects:
+            console.print(f"[green]No stale projects (inactive {days}+ days)[/green]")
+            return
 
-    if not projects:
-        console.print(f"[green]No stale projects (inactive {days}+ days)[/green]")
-        session.close()
-        return
+        table = Table(title=f"Stale Projects (inactive {days}+ days)", box=box.ROUNDED)
+        table.add_column("Project")
+        table.add_column("Category")
+        table.add_column("Last Activity")
+        table.add_column("Days", justify="right")
+        table.add_column("Priority")
+        table.add_column("Done", justify="right")
+        table.add_column("Notes")
 
-    table = Table(title=f"Stale Projects (inactive {days}+ days)", box=box.ROUNDED)
-    table.add_column("Project")
-    table.add_column("Category")
-    table.add_column("Last Activity")
-    table.add_column("Days", justify="right")
-    table.add_column("Priority")
-    table.add_column("Done", justify="right")
-    table.add_column("Notes")
-
-    for p in projects:
-        days_inactive = (datetime.now(timezone.utc).replace(tzinfo=None) - p.last_activity).days if p.last_activity else "—"
-        activity = p.last_activity.strftime("%Y-%m-%d") if p.last_activity else "never"
-        notes_preview = (p.notes[:30] + "...") if p.notes and len(p.notes) > 30 else (p.notes or "")
-
-        table.add_row(
-            p.name,
-            p.category or "",
-            activity,
-            str(days_inactive),
-            p.priority_label,
-            f"{p.completion_pct:.0f}%" if p.completion_pct else "—",
-            notes_preview,
-        )
-
-    console.print(table)
-    console.print(f"\n[dim]Total: {len(projects)} stale projects[/dim]")
-
-    if action:
         for p in projects:
-            _prompt_stale_action(session, p)
+            days_inactive = (datetime.now(timezone.utc).replace(tzinfo=None) - p.last_activity).days if p.last_activity else "—"
+            activity = p.last_activity.strftime("%Y-%m-%d") if p.last_activity else "never"
+            notes_preview = (p.notes[:30] + "...") if p.notes and len(p.notes) > 30 else (p.notes or "")
 
-    session.close()
+            table.add_row(
+                p.name,
+                p.category or "",
+                activity,
+                str(days_inactive),
+                p.priority_label,
+                f"{p.completion_pct:.0f}%" if p.completion_pct else "—",
+                notes_preview,
+            )
+
+        console.print(table)
+        console.print(f"\n[dim]Total: {len(projects)} stale projects[/dim]")
+
+        if action:
+            for p in projects:
+                _prompt_stale_action(session, p)
 
 
 def _prompt_stale_action(session, project: Project) -> None:
@@ -1395,17 +1348,18 @@ def run_prompt(project_name: str, prompt: str, budget: float, timeout: int, tool
     """
 
     init_db()
-    session = get_session()
+    with db_session() as session:
+        project = session.query(Project).filter(Project.name.ilike(f"%{project_name}%")).first()
+        if not project:
+            console.print(f"[red]Project '{project_name}' not found[/red]")
+            return
 
-    project = session.query(Project).filter(Project.name.ilike(f"%{project_name}%")).first()
-    if not project:
-        console.print(f"[red]Project '{project_name}' not found[/red]")
-        session.close()
-        return
+        project_name_val = project.name
+        project_path_val = project.path
 
     allowed_tools = [t.strip() for t in tools.split(",")] if tools else ["Read", "Glob", "Grep"]
 
-    console.print(f"[bold blue]Running prompt on {project.name}[/bold blue]")
+    console.print(f"[bold blue]Running prompt on {project_name_val}[/bold blue]")
     console.print(f"  Budget: ${budget:.2f} | Timeout: {timeout}s | Tools: {', '.join(allowed_tools)}")
     console.print(f"  Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
     console.print()
@@ -1425,7 +1379,7 @@ def run_prompt(project_name: str, prompt: str, budget: float, timeout: int, tool
         try:
             result = subprocess.run(
                 cmd,
-                cwd=str(project.path),
+                cwd=str(project_path_val),
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -1459,13 +1413,13 @@ def run_prompt(project_name: str, prompt: str, budget: float, timeout: int, tool
             status = "error"
 
     # Log to transcript — sanitize project name to prevent path traversal
-    safe_name = re.sub(r'[^\w\-]', '_', project.name)
+    safe_name = re.sub(r'[^\w\-]', '_', project_name_val)
     transcript_dir = Path(__file__).parent.parent / "transcripts" / safe_name
     transcript_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).replace(tzinfo=None).strftime("%Y%m%d-%H%M%S")
     transcript_file = transcript_dir / f"{timestamp}.md"
 
-    transcript_content = f"""# Prompt Run: {project.name}
+    transcript_content = f"""# Prompt Run: {project_name_val}
 
 - **Date:** {datetime.now(timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S UTC')}
 - **Status:** {status}
@@ -1484,8 +1438,6 @@ def run_prompt(project_name: str, prompt: str, budget: float, timeout: int, tool
     transcript_file.write_text(transcript_content)
     console.print(f"\n[dim]Transcript saved: {transcript_file}[/dim]")
     console.print(f"[dim]Duration: {duration:.1f}s[/dim]")
-
-    session.close()
 
 
 @main.command("transcripts")
@@ -1576,39 +1528,37 @@ def launch(target: str, dirty_only: bool, dry_run: bool, terminal: bool):
         pm launch --terminal   # Force Terminal.app
     """
     init_db()
-    session = get_session()
 
     # Detect terminal once up front
     term = detect_terminal(force_terminal=terminal)
 
     # Check if target is a number or project name
-    try:
-        count = int(target)
-        # It's a number - launch top N
-        query = session.query(Project).filter(
-            (Project.archived == False) | (Project.archived == None)
-        ).order_by(Project.last_activity.desc().nullslast())
+    with db_session() as session:
+        try:
+            count = int(target)
+            # It's a number - launch top N
+            query = session.query(Project).filter(
+                (Project.archived == False) | (Project.archived == None)
+            ).order_by(Project.last_activity.desc().nullslast())
 
-        if dirty_only:
-            query = query.filter(Project.git_dirty == True)
+            if dirty_only:
+                query = query.filter(Project.git_dirty == True)
 
-        projects = query.limit(count).all()
-    except ValueError:
-        # It's a project name - find and launch it
-        project = session.query(Project).filter(
-            Project.name.ilike(f"%{target}%")
-        ).first()
+            projects = query.limit(count).all()
+        except ValueError:
+            # It's a project name - find and launch it
+            project = session.query(Project).filter(
+                Project.name.ilike(f"%{target}%")
+            ).first()
 
-        if not project:
-            console.print(f"[red]Project '{target}' not found[/red]")
-            session.close()
-            return
+            if not project:
+                console.print(f"[red]Project '{target}' not found[/red]")
+                return
 
-        projects = [project]
+            projects = [project]
 
     if not projects:
         console.print("[yellow]No projects found matching criteria[/yellow]")
-        session.close()
         return
 
     # Display what we're launching
@@ -1634,7 +1584,6 @@ def launch(target: str, dirty_only: bool, dry_run: bool, terminal: bool):
 
     if dry_run:
         console.print(f"\n[dim]Dry run - would use {term.value} - no terminals opened[/dim]")
-        session.close()
         return
 
     console.print(f"\n[bold blue]Opening {len(projects)} sessions via {term.value}...[/bold blue]")
@@ -1653,7 +1602,6 @@ def launch(target: str, dirty_only: bool, dry_run: bool, terminal: bool):
         console.print(f"  [red]✗[/red] Failed to launch: {e}")
 
     console.print(f"\n[bold green]Launched {len(projects)} Claude Code sessions[/bold green]")
-    session.close()
 
 
 def _shutdown_terminal_app(no_context: bool, dry_run: bool, context_wait: int) -> None:
@@ -2092,175 +2040,170 @@ def docs_generate(
         templates.append(tmpl)
 
     init_db()
-    session = get_session()
+    with db_session() as session:
 
-    # Find target projects
-    if project_name:
-        project = session.query(Project).filter(
-            Project.name.ilike(f"%{project_name}%")
-        ).first()
-        if not project:
-            console.print(f"[red]Project '{project_name}' not found[/red]")
-            session.close()
-            return
-        projects = [project]
-    elif gen_all:
-        projects = session.query(Project).filter(
-            (Project.archived == False) | (Project.archived == None)
-        ).all()
-    elif filter_str:
-        query = session.query(Project).filter(
-            (Project.archived == False) | (Project.archived == None)
-        )
-        query = apply_project_filter(query, filter_str)
-        projects = query.all()
-    elif top:
-        all_projects = session.query(Project).filter(
-            (Project.archived == False) | (Project.archived == None)
-        ).all()
-        all_projects.sort(key=lambda p: p.urgency_score, reverse=True)
-        projects = all_projects[:top]
-    else:
-        console.print("[yellow]Specify a project name, --all, --filter, or --top[/yellow]")
-        session.close()
-        return
-
-    if not projects:
-        console.print("[yellow]No projects found[/yellow]")
-        session.close()
-        return
-
-    # Check for staleness (skip recent unless --force)
-    stale_days = 7
-    tasks_to_run = []
-
-    for project in projects:
-        ctx = build_context(project)
-        for tmpl in templates:
-            # Check if recently generated
-            if not force:
-                recent = session.query(DocGeneration).filter(
-                    DocGeneration.project_id == project.id,
-                    DocGeneration.template_id == tmpl.id,
-                    DocGeneration.status == "success",
-                ).order_by(DocGeneration.generated_at.desc()).first()
-
-                if recent and recent.generated_at:
-                    from datetime import timedelta
-                    age = datetime.now(timezone.utc).replace(tzinfo=None) - recent.generated_at
-                    if age < timedelta(days=stale_days):
-                        if not dry_run:
-                            console.print(
-                                f"[dim]Skipping {project.name}/{tmpl.id} "
-                                f"(generated {age.days}d ago, use --force)[/dim]"
-                            )
-                        continue
-
-            # Resolve output file
-            out_dir = output_dir or tmpl.output_dir
-            filename = tmpl.output_filename
-            if "{date}" in filename:
-                filename = filename.replace("{date}", datetime.now().strftime("%Y-%m-%d"))
-
-            output_file = Path(project.path) / out_dir / filename
-            budget = max_budget if max_budget else tmpl.max_budget_usd
-
-            # Handle weekly-summary specially (multi-project)
-            if tmpl.id == "weekly-summary":
-                # Build cross-project context as notes
-                summary_lines = []
-                for p in projects:
-                    pct = p.completion_pct or 0
-                    summary_lines.append(
-                        f"- {p.name} ({p.category}): {pct:.0f}% complete, "
-                        f"health {p.health_score}/100, "
-                        f"phase: {p.current_phase or 'unknown'}, "
-                        f"next: {p.next_action or 'none'}"
-                    )
-                ctx.notes = "\n".join(summary_lines)
-
-            prompt = tmpl.render(ctx)
-
-            tasks_to_run.append({
-                "project_path": Path(project.path),
-                "prompt": prompt,
-                "output_file": output_file,
-                "max_budget_usd": budget,
-                "allowed_tools": tmpl.allowed_tools,
-                "project_id": project.id,
-                "template_id": tmpl.id,
-                "output_rel": f"{out_dir}/{filename}",
-            })
-
-    if not tasks_to_run:
-        console.print("[yellow]Nothing to generate (all docs are up-to-date)[/yellow]")
-        session.close()
-        return
-
-    # Dry run - show what would be generated
-    if dry_run:
-        table = Table(title="Documents to Generate (dry run)", box=box.SIMPLE)
-        table.add_column("Project")
-        table.add_column("Template")
-        table.add_column("Output")
-        table.add_column("Budget")
-
-        for task in tasks_to_run:
-            table.add_row(
-                task["project_path"].name,
-                task["template_id"],
-                task["output_rel"],
-                f"${task['max_budget_usd']:.2f}",
+        # Find target projects
+        if project_name:
+            project = session.query(Project).filter(
+                Project.name.ilike(f"%{project_name}%")
+            ).first()
+            if not project:
+                console.print(f"[red]Project '{project_name}' not found[/red]")
+                return
+            projects = [project]
+        elif gen_all:
+            projects = session.query(Project).filter(
+                (Project.archived == False) | (Project.archived == None)
+            ).all()
+        elif filter_str:
+            query = session.query(Project).filter(
+                (Project.archived == False) | (Project.archived == None)
             )
-
-        console.print(table)
-        console.print(f"\n[dim]{len(tasks_to_run)} documents would be generated[/dim]")
-        session.close()
-        return
-
-    # Execute generation
-    console.print(f"[bold blue]Generating {len(tasks_to_run)} documents "
-                  f"(max {parallel} parallel)...[/bold blue]")
-
-    def on_result(result: DocResult):
-        if result.status == "success":
-            console.print(
-                f"  [green]OK[/green] {result.project_name}/{result.template_id} "
-                f"({result.duration_secs:.1f}s, {result.file_size_bytes} bytes)"
-            )
-        elif result.status == "timeout":
-            console.print(
-                f"  [yellow]TIMEOUT[/yellow] {result.project_name}/{result.template_id} "
-                f"({result.error_message})"
-            )
+            query = apply_project_filter(query, filter_str)
+            projects = query.all()
+        elif top:
+            all_projects = session.query(Project).filter(
+                (Project.archived == False) | (Project.archived == None)
+            ).all()
+            all_projects.sort(key=lambda p: p.urgency_score, reverse=True)
+            projects = all_projects[:top]
         else:
-            console.print(
-                f"  [red]ERROR[/red] {result.project_name}/{result.template_id}: "
-                f"{result.error_message}"
-            )
+            console.print("[yellow]Specify a project name, --all, --filter, or --top[/yellow]")
+            return
 
-    results = run_batch_generation(
-        tasks=[{k: v for k, v in t.items() if k not in ("project_id", "template_id", "output_rel")}
-               for t in tasks_to_run],
-        max_workers=parallel,
-        progress_callback=on_result,
-    )
+        if not projects:
+            console.print("[yellow]No projects found[/yellow]")
+            return
 
-    # Record results in database
-    for task, result in zip(tasks_to_run, results):
-        doc_gen = DocGeneration(
-            project_id=task["project_id"],
-            template_id=task["template_id"],
-            output_path=task["output_rel"],
-            generated_at=datetime.now(timezone.utc).replace(tzinfo=None),
-            duration_secs=result.duration_secs,
-            status=result.status,
-            error_message=result.error_message if result.status != "success" else None,
-            file_size_bytes=result.file_size_bytes,
+        # Check for staleness (skip recent unless --force)
+        stale_days = 7
+        tasks_to_run = []
+
+        for project in projects:
+            ctx = build_context(project)
+            for tmpl in templates:
+                # Check if recently generated
+                if not force:
+                    recent = session.query(DocGeneration).filter(
+                        DocGeneration.project_id == project.id,
+                        DocGeneration.template_id == tmpl.id,
+                        DocGeneration.status == "success",
+                    ).order_by(DocGeneration.generated_at.desc()).first()
+
+                    if recent and recent.generated_at:
+                        from datetime import timedelta
+                        age = datetime.now(timezone.utc).replace(tzinfo=None) - recent.generated_at
+                        if age < timedelta(days=stale_days):
+                            if not dry_run:
+                                console.print(
+                                    f"[dim]Skipping {project.name}/{tmpl.id} "
+                                    f"(generated {age.days}d ago, use --force)[/dim]"
+                                )
+                            continue
+
+                # Resolve output file
+                out_dir = output_dir or tmpl.output_dir
+                filename = tmpl.output_filename
+                if "{date}" in filename:
+                    filename = filename.replace("{date}", datetime.now().strftime("%Y-%m-%d"))
+
+                output_file = Path(project.path) / out_dir / filename
+                budget = max_budget if max_budget else tmpl.max_budget_usd
+
+                # Handle weekly-summary specially (multi-project)
+                if tmpl.id == "weekly-summary":
+                    # Build cross-project context as notes
+                    summary_lines = []
+                    for p in projects:
+                        pct = p.completion_pct or 0
+                        summary_lines.append(
+                            f"- {p.name} ({p.category}): {pct:.0f}% complete, "
+                            f"health {p.health_score}/100, "
+                            f"phase: {p.current_phase or 'unknown'}, "
+                            f"next: {p.next_action or 'none'}"
+                        )
+                    ctx.notes = "\n".join(summary_lines)
+
+                prompt = tmpl.render(ctx)
+
+                tasks_to_run.append({
+                    "project_path": Path(project.path),
+                    "prompt": prompt,
+                    "output_file": output_file,
+                    "max_budget_usd": budget,
+                    "allowed_tools": tmpl.allowed_tools,
+                    "project_id": project.id,
+                    "template_id": tmpl.id,
+                    "output_rel": f"{out_dir}/{filename}",
+                })
+
+        if not tasks_to_run:
+            console.print("[yellow]Nothing to generate (all docs are up-to-date)[/yellow]")
+            return
+
+        # Dry run - show what would be generated
+        if dry_run:
+            table = Table(title="Documents to Generate (dry run)", box=box.SIMPLE)
+            table.add_column("Project")
+            table.add_column("Template")
+            table.add_column("Output")
+            table.add_column("Budget")
+
+            for task in tasks_to_run:
+                table.add_row(
+                    task["project_path"].name,
+                    task["template_id"],
+                    task["output_rel"],
+                    f"${task['max_budget_usd']:.2f}",
+                )
+
+            console.print(table)
+            console.print(f"\n[dim]{len(tasks_to_run)} documents would be generated[/dim]")
+            return
+
+        # Execute generation
+        console.print(f"[bold blue]Generating {len(tasks_to_run)} documents "
+                      f"(max {parallel} parallel)...[/bold blue]")
+
+        def on_result(result: DocResult):
+            if result.status == "success":
+                console.print(
+                    f"  [green]OK[/green] {result.project_name}/{result.template_id} "
+                    f"({result.duration_secs:.1f}s, {result.file_size_bytes} bytes)"
+                )
+            elif result.status == "timeout":
+                console.print(
+                    f"  [yellow]TIMEOUT[/yellow] {result.project_name}/{result.template_id} "
+                    f"({result.error_message})"
+                )
+            else:
+                console.print(
+                    f"  [red]ERROR[/red] {result.project_name}/{result.template_id}: "
+                    f"{result.error_message}"
+                )
+
+        results = run_batch_generation(
+            tasks=[{k: v for k, v in t.items() if k not in ("project_id", "template_id", "output_rel")}
+                   for t in tasks_to_run],
+            max_workers=parallel,
+            progress_callback=on_result,
         )
-        session.add(doc_gen)
 
-    session.commit()
+        # Record results in database
+        for task, result in zip(tasks_to_run, results):
+            doc_gen = DocGeneration(
+                project_id=task["project_id"],
+                template_id=task["template_id"],
+                output_path=task["output_rel"],
+                generated_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                duration_secs=result.duration_secs,
+                status=result.status,
+                error_message=result.error_message if result.status != "success" else None,
+                file_size_bytes=result.file_size_bytes,
+            )
+            session.add(doc_gen)
+
+        session.commit()
 
     # Summary
     success = sum(1 for r in results if r.status == "success")
@@ -2276,8 +2219,6 @@ def docs_generate(
         border_style="green" if errors == 0 else "yellow",
     ))
 
-    session.close()
-
 
 @docs.command("history")
 @click.argument("project_name", required=False)
@@ -2287,76 +2228,73 @@ def docs_history(project_name: Optional[str], limit: int):
     from .database.models import DocGeneration
 
     init_db()
-    session = get_session()
+    with db_session() as session:
 
-    query = session.query(DocGeneration).order_by(DocGeneration.generated_at.desc())
+        query = session.query(DocGeneration).order_by(DocGeneration.generated_at.desc())
 
-    if project_name:
-        # Find matching project
-        project = session.query(Project).filter(
-            Project.name.ilike(f"%{project_name}%")
-        ).first()
-        if not project:
-            console.print(f"[red]Project '{project_name}' not found[/red]")
-            session.close()
+        if project_name:
+            # Find matching project
+            project = session.query(Project).filter(
+                Project.name.ilike(f"%{project_name}%")
+            ).first()
+            if not project:
+                console.print(f"[red]Project '{project_name}' not found[/red]")
+                return
+            query = query.filter(DocGeneration.project_id == project.id)
+
+        if limit > 0:
+            query = query.limit(limit)
+
+        records = query.all()
+
+        if not records:
+            console.print("[yellow]No generation history found[/yellow]")
             return
-        query = query.filter(DocGeneration.project_id == project.id)
 
-    if limit > 0:
-        query = query.limit(limit)
+        table = Table(title="Document Generation History", box=box.ROUNDED)
+        table.add_column("Date", width=18)
+        table.add_column("Project", width=20)
+        table.add_column("Template", width=16)
+        table.add_column("Status", width=10)
+        table.add_column("Duration", width=10)
+        table.add_column("Size", width=10)
+        table.add_column("Output", min_width=20)
 
-    records = query.all()
+        for rec in records:
+            # Get project name
+            proj = session.query(Project).filter_by(id=rec.project_id).first()
+            proj_name = proj.name if proj else rec.project_id
 
-    if not records:
-        console.print("[yellow]No generation history found[/yellow]")
-        session.close()
-        return
+            # Status styling
+            status_styles = {"success": "green", "error": "red", "timeout": "yellow"}
+            style = status_styles.get(rec.status, "white")
 
-    table = Table(title="Document Generation History", box=box.ROUNDED)
-    table.add_column("Date", width=18)
-    table.add_column("Project", width=20)
-    table.add_column("Template", width=16)
-    table.add_column("Status", width=10)
-    table.add_column("Duration", width=10)
-    table.add_column("Size", width=10)
-    table.add_column("Output", min_width=20)
+            # Format date
+            date_str = rec.generated_at.strftime("%Y-%m-%d %H:%M") if rec.generated_at else "—"
 
-    for rec in records:
-        # Get project name
-        proj = session.query(Project).filter_by(id=rec.project_id).first()
-        proj_name = proj.name if proj else rec.project_id
+            # Format duration
+            dur_str = f"{rec.duration_secs:.1f}s" if rec.duration_secs else "—"
 
-        # Status styling
-        status_styles = {"success": "green", "error": "red", "timeout": "yellow"}
-        style = status_styles.get(rec.status, "white")
-
-        # Format date
-        date_str = rec.generated_at.strftime("%Y-%m-%d %H:%M") if rec.generated_at else "—"
-
-        # Format duration
-        dur_str = f"{rec.duration_secs:.1f}s" if rec.duration_secs else "—"
-
-        # Format size
-        if rec.file_size_bytes:
-            if rec.file_size_bytes > 1024:
-                size_str = f"{rec.file_size_bytes / 1024:.1f}KB"
+            # Format size
+            if rec.file_size_bytes:
+                if rec.file_size_bytes > 1024:
+                    size_str = f"{rec.file_size_bytes / 1024:.1f}KB"
+                else:
+                    size_str = f"{rec.file_size_bytes}B"
             else:
-                size_str = f"{rec.file_size_bytes}B"
-        else:
-            size_str = "—"
+                size_str = "—"
 
-        table.add_row(
-            date_str,
-            proj_name,
-            rec.template_id,
-            f"[{style}]{rec.status}[/{style}]",
-            dur_str,
-            size_str,
-            rec.output_path or "—",
-        )
+            table.add_row(
+                date_str,
+                proj_name,
+                rec.template_id,
+                f"[{style}]{rec.status}[/{style}]",
+                dur_str,
+                size_str,
+                rec.output_path or "—",
+            )
 
-    console.print(table)
-    session.close()
+        console.print(table)
 
 
 @docs.command("status")
@@ -2372,65 +2310,63 @@ def docs_status(project_name: Optional[str], stale_days: int):
     from datetime import timedelta
 
     init_db()
-    session = get_session()
+    with db_session() as session:
 
-    # Get projects
-    query = session.query(Project).filter(
-        (Project.archived == False) | (Project.archived == None)
-    )
-    if project_name:
-        query = query.filter(Project.name.ilike(f"%{project_name}%"))
+        # Get projects
+        query = session.query(Project).filter(
+            (Project.archived == False) | (Project.archived == None)
+        )
+        if project_name:
+            query = query.filter(Project.name.ilike(f"%{project_name}%"))
 
-    projects = query.order_by(Project.name).all()
+        projects = query.order_by(Project.name).all()
 
-    if not projects:
-        console.print("[yellow]No projects found[/yellow]")
-        session.close()
-        return
+        if not projects:
+            console.print("[yellow]No projects found[/yellow]")
+            return
 
-    # Template IDs (excluding weekly-summary which is cross-project)
-    template_ids = [t.id for t in BUILTIN_TEMPLATES.values() if t.id != "weekly-summary"]
+        # Template IDs (excluding weekly-summary which is cross-project)
+        template_ids = [t.id for t in BUILTIN_TEMPLATES.values() if t.id != "weekly-summary"]
 
-    table = Table(title="Document Status", box=box.ROUNDED)
-    table.add_column("Project", style="bold", width=20)
-
-    for tid in template_ids:
-        table.add_column(tid, width=14)
-
-    stale_threshold = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=stale_days)
-
-    for proj in projects:
-        row = [proj.name]
+        table = Table(title="Document Status", box=box.ROUNDED)
+        table.add_column("Project", style="bold", width=20)
 
         for tid in template_ids:
-            # Check latest generation
-            latest = session.query(DocGeneration).filter(
-                DocGeneration.project_id == proj.id,
-                DocGeneration.template_id == tid,
-                DocGeneration.status == "success",
-            ).order_by(DocGeneration.generated_at.desc()).first()
+            table.add_column(tid, width=14)
 
-            if latest and latest.generated_at:
-                age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - latest.generated_at).days
-                if latest.generated_at < stale_threshold:
-                    row.append(f"[yellow]{age_days}d ago[/yellow]")
+        stale_threshold = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=stale_days)
+
+        for proj in projects:
+            row = [proj.name]
+
+            for tid in template_ids:
+                # Check latest generation
+                latest = session.query(DocGeneration).filter(
+                    DocGeneration.project_id == proj.id,
+                    DocGeneration.template_id == tid,
+                    DocGeneration.status == "success",
+                ).order_by(DocGeneration.generated_at.desc()).first()
+
+                if latest and latest.generated_at:
+                    age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - latest.generated_at).days
+                    if latest.generated_at < stale_threshold:
+                        row.append(f"[yellow]{age_days}d ago[/yellow]")
+                    else:
+                        row.append(f"[green]{age_days}d ago[/green]")
                 else:
-                    row.append(f"[green]{age_days}d ago[/green]")
-            else:
-                # Check if file exists on disk
-                tmpl = BUILTIN_TEMPLATES[tid]
-                doc_path = Path(proj.path) / tmpl.output_dir / tmpl.output_filename
-                if doc_path.exists():
-                    row.append("[dim]exists*[/dim]")
-                else:
-                    row.append("[dim]—[/dim]")
+                    # Check if file exists on disk
+                    tmpl = BUILTIN_TEMPLATES[tid]
+                    doc_path = Path(proj.path) / tmpl.output_dir / tmpl.output_filename
+                    if doc_path.exists():
+                        row.append("[dim]exists*[/dim]")
+                    else:
+                        row.append("[dim]—[/dim]")
 
-        table.add_row(*row)
+            table.add_row(*row)
 
-    console.print(table)
-    console.print(f"\n[dim]* = file exists but no generation record  |  "
-                  f"Stale threshold: {stale_days} days[/dim]")
-    session.close()
+        console.print(table)
+        console.print(f"\n[dim]* = file exists but no generation record  |  "
+                      f"Stale threshold: {stale_days} days[/dim]")
 
 
 # ── Agent Orchestration ──────────────────────────────────────────────────────
@@ -2446,28 +2382,27 @@ def _record_agent_run(
     """Persist an AgentRun record to the database."""
     from .database.models import AgentRun
     try:
-        session = get_session()
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        total_duration = (now - started).total_seconds()
-        run = AgentRun(
-            project_id=project_id,
-            started_at=started,
-            completed_at=now,
-            duration_secs=total_duration,
-            confidence=assessment.confidence if assessment else None,
-            proposed_action=assessment.proposed_action if assessment else None,
-            proposed_prompt=assessment.proposed_prompt if assessment else None,
-            reasoning=assessment.reasoning if assessment else None,
-            risk_level=assessment.risk_level if assessment else None,
-            assess_duration_secs=assessment.duration_secs if assessment else None,
-            status=status,
-            output=run_result.output[:2000] if run_result and run_result.output else None,
-            error_message=run_result.error if run_result else None,
-            cost_usd=run_result.cost_usd if run_result else None,
-        )
-        session.add(run)
-        session.commit()
-        session.close()
+        with db_session() as session:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            total_duration = (now - started).total_seconds()
+            run = AgentRun(
+                project_id=project_id,
+                started_at=started,
+                completed_at=now,
+                duration_secs=total_duration,
+                confidence=assessment.confidence if assessment else None,
+                proposed_action=assessment.proposed_action if assessment else None,
+                proposed_prompt=assessment.proposed_prompt if assessment else None,
+                reasoning=assessment.reasoning if assessment else None,
+                risk_level=assessment.risk_level if assessment else None,
+                assess_duration_secs=assessment.duration_secs if assessment else None,
+                status=status,
+                output=run_result.output[:2000] if run_result and run_result.output else None,
+                error_message=run_result.error if run_result else None,
+                cost_usd=run_result.cost_usd if run_result else None,
+            )
+            session.add(run)
+            session.commit()
     except Exception:
         pass  # Never let DB writes crash the agent
 
@@ -2495,11 +2430,10 @@ def agent_assess(project_name: str, context: Optional[str], timeout: int):
     from .agent.planner import plan_project
 
     init_db()
-    session = get_session()
-    project = session.query(Project).filter(
-        Project.name.ilike(f"%{project_name}%")
-    ).first()
-    session.close()
+    with db_session() as session:
+        project = session.query(Project).filter(
+            Project.name.ilike(f"%{project_name}%")
+        ).first()
 
     if not project:
         console.print(f"[red]No project found matching '{project_name}'[/red]")
@@ -2565,11 +2499,10 @@ def agent_run(
     from .database.models import AgentRun
 
     init_db()
-    session = get_session()
-    project = session.query(Project).filter(
-        Project.name.ilike(f"%{project_name}%")
-    ).first()
-    session.close()
+    with db_session() as session:
+        project = session.query(Project).filter(
+            Project.name.ilike(f"%{project_name}%")
+        ).first()
 
     if not project:
         console.print(f"[red]No project found matching '{project_name}'[/red]")
@@ -2658,12 +2591,10 @@ def agent_batch(
     from .agent.coordinator import AgentCoordinator
 
     init_db()
-    session = get_session()
-
-    query = session.query(Project).filter(Project.archived == False)
-    query = apply_project_filter(query, filter_str)
-    projects = query.all()
-    session.close()
+    with db_session() as session:
+        query = session.query(Project).filter(Project.archived == False)
+        query = apply_project_filter(query, filter_str)
+        projects = query.all()
 
     # Sort by urgency, take top N
     projects_sorted = sorted(projects, key=lambda p: p.urgency_score, reverse=True)[:limit]
@@ -2721,11 +2652,10 @@ def agent_memory(project_name: str, clear: bool):
     """
     from .agent.memory import read_memory, clear_memory as _clear_memory
 
-    session = get_session()
-    project = session.query(Project).filter(
-        Project.name.ilike(f"%{project_name}%")
-    ).first()
-    session.close()
+    with db_session() as session:
+        project = session.query(Project).filter(
+            Project.name.ilike(f"%{project_name}%")
+        ).first()
 
     if not project:
         console.print(f"[red]No project found matching '{project_name}'[/red]")
@@ -2788,26 +2718,24 @@ def agent_costs(days: int, limit: int):
 
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
 
-    session = get_session()
-
-    # Aggregate by project
-    rows = (
-        session.query(
-            Project.name,
-            Project.client_name,
-            func.count(AgentRun.id).label("runs"),
-            func.sum(AgentRun.cost_usd).label("total_cost"),
-            func.avg(AgentRun.duration_secs).label("avg_duration"),
-            func.max(AgentRun.started_at).label("last_run"),
+    with db_session() as session:
+        # Aggregate by project
+        rows = (
+            session.query(
+                Project.name,
+                Project.client_name,
+                func.count(AgentRun.id).label("runs"),
+                func.sum(AgentRun.cost_usd).label("total_cost"),
+                func.avg(AgentRun.duration_secs).label("avg_duration"),
+                func.max(AgentRun.started_at).label("last_run"),
+            )
+            .join(AgentRun, AgentRun.project_id == Project.id)
+            .filter(AgentRun.started_at >= cutoff)
+            .group_by(Project.id)
+            .order_by(func.sum(AgentRun.cost_usd).desc())
+            .limit(limit)
+            .all()
         )
-        .join(AgentRun, AgentRun.project_id == Project.id)
-        .filter(AgentRun.started_at >= cutoff)
-        .group_by(Project.id)
-        .order_by(func.sum(AgentRun.cost_usd).desc())
-        .limit(limit)
-        .all()
-    )
-    session.close()
 
     if not rows:
         console.print(f"[dim]No agent runs in the last {days} days.[/dim]")
@@ -2893,18 +2821,17 @@ def triage(limit: int, imessage: bool, dry_run: bool, timeout: int):
     import re as _re
 
     init_db()
-    session = get_session()
-    projects = (
-        session.query(Project)
-        .filter(
-            Project.has_pending_decision == True,
-            Project.archived == False,
+    with db_session() as session:
+        projects = (
+            session.query(Project)
+            .filter(
+                Project.has_pending_decision == True,
+                Project.archived == False,
+            )
+            .order_by(Project.priority.asc(), Project.name.asc())
+            .limit(limit)
+            .all()
         )
-        .order_by(Project.priority.asc(), Project.name.asc())
-        .limit(limit)
-        .all()
-    )
-    session.close()
 
     if not projects:
         console.print("[dim]No projects with pending decisions.[/dim]")
@@ -3161,35 +3088,32 @@ def schedule_status():
 @click.option("--dry-run", is_flag=True, help="Show what would be removed without deleting")
 def gc(dry_run: bool):
     """Remove DB records for projects that no longer exist on disk."""
-    session = get_session()
-    projects = session.query(Project).all()
+    with db_session() as session:
+        projects = session.query(Project).all()
 
-    removed = []
-    for project in projects:
-        if not Path(project.path).exists():
-            removed.append(project)
+        removed = []
+        for project in projects:
+            if not Path(project.path).exists():
+                removed.append(project)
 
-    if not removed:
-        console.print("[dim]No stale records found.[/dim]")
-        session.close()
-        return
+        if not removed:
+            console.print("[dim]No stale records found.[/dim]")
+            return
 
-    table = Table("Name", "Path", "Last Scanned")
-    for p in removed:
-        scanned = p.last_scanned.strftime("%Y-%m-%d") if p.last_scanned else "never"
-        table.add_row(p.name, p.path, scanned)
-
-    console.print(table)
-
-    if dry_run:
-        console.print(f"\n[yellow]Dry run: {len(removed)} record(s) would be removed.[/yellow]")
-    else:
+        table = Table("Name", "Path", "Last Scanned")
         for p in removed:
-            session.delete(p)
-        session.commit()
-        console.print(f"\n[green]Removed {len(removed)} stale record(s).[/green]")
+            scanned = p.last_scanned.strftime("%Y-%m-%d") if p.last_scanned else "never"
+            table.add_row(p.name, p.path, scanned)
 
-    session.close()
+        console.print(table)
+
+        if dry_run:
+            console.print(f"\n[yellow]Dry run: {len(removed)} record(s) would be removed.[/yellow]")
+        else:
+            for p in removed:
+                session.delete(p)
+            session.commit()
+            console.print(f"\n[green]Removed {len(removed)} stale record(s).[/green]")
 
 
 if __name__ == "__main__":

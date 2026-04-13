@@ -21,7 +21,8 @@ pm edit <project> --priority 1 --deadline 2025-02-01
 pm someday <project>         # Park a project in the Someday pile (priority 5)
 pm backlog                   # Show someday + archived projects
 pm health                    # Detailed health report
-pm context <project>         # Generate Claude Code continue prompt
+pm continue [project]        # Generate Claude Code continue prompt
+pm summary                   # Quick portfolio summary (counts by type/category/health)
 pm tags list                 # See all tags with counts
 pm digest                    # Week-to-date activity digest
 pm stale                     # Find inactive projects
@@ -263,7 +264,7 @@ pm urgent                   # Show only projects with urgency signals (deadlines
     --all                   # Show all projects ranked by urgency score
 pm backlog                  # Show someday/archived projects
 pm someday <name>           # Move project to Someday pile (priority 5); restore with pm edit --priority 3
-pm context <name>           # Generate Claude Code context prompt
+pm continue <name>           # Generate Claude Code context prompt
 
 # ── Morning Briefing ──
 pm brief                    # Intelligent daily briefing
